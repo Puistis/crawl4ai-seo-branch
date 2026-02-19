@@ -160,8 +160,11 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
     ) -> List[CrawlResult]:
         """
         Batch (non-streaming) mode:
-        Processes one BFS level at a time, then yields all the results.
+        Crawls pages ONE AT A TIME with a hard per-page timeout to prevent
+        a single hanging page from blocking the entire crawl.
         """
+        PER_PAGE_TIMEOUT = config.page_timeout / 1000 if config.page_timeout else 30
+
         # Conditional state initialization for resume support
         if self._resume_state:
             visited = set(self._resume_state.get("visited", []))
@@ -180,6 +183,9 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
         results: List[CrawlResult] = []
 
+        # Clone the config once to disable deep crawling recursion.
+        single_config = config.clone(deep_crawl_strategy=None, stream=False)
+
         while current_level and not self._cancel_event.is_set():
             # Check if we've already reached max_pages before starting a new level
             if self._pages_crawled >= self.max_pages:
@@ -187,40 +193,67 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
                 break
             
             next_level: List[Tuple[str, Optional[str]]] = []
-            urls = [url for url, _ in current_level]
 
-            # Clone the config to disable deep crawling recursion and enforce batch mode.
-            batch_config = config.clone(deep_crawl_strategy=None, stream=False)
-            batch_results = await crawler.arun_many(urls=urls, config=batch_config)
+            for page_url, parent_url in current_level:
+                if self._cancel_event.is_set():
+                    break
+                if self._pages_crawled >= self.max_pages:
+                    self.logger.info(f"Max pages limit ({self.max_pages}) reached mid-level, stopping")
+                    break
 
-            for result in batch_results:
-                url = result.url
-                depth = depths.get(url, 0)
+                depth = depths.get(page_url, 0)
+
+                # Crawl single page with hard timeout
+                try:
+                    page_results = await asyncio.wait_for(
+                        crawler.arun_many(urls=[page_url], config=single_config),
+                        timeout=PER_PAGE_TIMEOUT,
+                    )
+                    result = page_results[0] if page_results else None
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"Page timed out after {PER_PAGE_TIMEOUT}s: {page_url}")
+                    result = CrawlResult(
+                        url=page_url,
+                        html="",
+                        success=False,
+                        status_code=0,
+                        error_message=f"Page timed out after {PER_PAGE_TIMEOUT}s",
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Page crawl failed: {page_url}: {e}")
+                    result = CrawlResult(
+                        url=page_url,
+                        html="",
+                        success=False,
+                        status_code=0,
+                        error_message=str(e),
+                    )
+
+                if result is None:
+                    continue
+
                 result.metadata = result.metadata or {}
                 result.metadata["depth"] = depth
-                parent_url = next((parent for (u, parent) in current_level if u == url), None)
                 result.metadata["parent_url"] = parent_url
                 results.append(result)
 
                 # Only discover links from successful crawls
                 if result.success:
-                    # Increment pages crawled per URL for accurate state tracking
                     self._pages_crawled += 1
+                    await self.link_discovery(result, page_url, depth, visited, next_level, depths)
 
-                    # Link discovery will handle the max pages limit internally
-                    await self.link_discovery(result, url, depth, visited, next_level, depths)
-
-                    # Capture state after EACH URL processed (if callback set)
-                    if self._on_state_change:
-                        state = {
-                            "strategy_type": "bfs",
-                            "visited": list(visited),
-                            "pending": [{"url": u, "parent_url": p} for u, p in next_level],
-                            "depths": depths,
-                            "pages_crawled": self._pages_crawled,
-                        }
-                        self._last_state = state
-                        await self._on_state_change(state)
+                # Capture state after EACH page (include result for incremental processing)
+                if self._on_state_change:
+                    state = {
+                        "strategy_type": "bfs",
+                        "visited": list(visited),
+                        "pending": [{"url": u, "parent_url": p} for u, p in next_level],
+                        "depths": depths,
+                        "pages_crawled": self._pages_crawled,
+                        "last_result": result,
+                    }
+                    self._last_state = state
+                    await self._on_state_change(state)
 
             current_level = next_level
 

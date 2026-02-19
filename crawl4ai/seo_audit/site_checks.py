@@ -670,7 +670,7 @@ def _compute_score_breakdown(
     technical = _category_score(tech_pass, tech_total, 15)
 
     # Structured data (5 pts)
-    sd_pass = sum(1 for r in results if r.structured_data.has_json_ld or r.structured_data.has_microdata)
+    sd_pass = sum(1 for r in results if r.structured_data.has_json_ld or len(r.structured_data.items) > 0)
     structured_data = _category_score(sd_pass, n, 5)
 
     # Domain (10 pts): robots.txt (5) + sitemap (5)
@@ -742,7 +742,7 @@ def _compute_pass_rates(pages: Dict[str, PageAuditResult]) -> Dict[str, float]:
             sum(1 for r in results if r.images.missing_alt == 0) / n, 3
         ),
         "structured_data_rate": round(
-            sum(1 for r in results if r.structured_data.has_json_ld or r.structured_data.has_microdata) / n, 3
+            sum(1 for r in results if r.structured_data.has_json_ld or len(r.structured_data.items) > 0) / n, 3
         ),
         "content_sufficient_rate": round(sum(1 for r in results if r.content.word_count >= 300) / n, 3),
         "no_mixed_content_rate": round(

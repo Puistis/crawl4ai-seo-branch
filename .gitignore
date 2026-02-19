@@ -239,3 +239,6 @@ instance/
 *.sh
 !scripts/gen-sbom.sh
 !infrastructure/deploy.sh
+
+# Ephemeral crawl4ai copy in docker build context (created during deploy, never commit)
+infrastructure/docker/crawl4ai/

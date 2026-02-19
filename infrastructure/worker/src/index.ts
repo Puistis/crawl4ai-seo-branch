@@ -428,8 +428,9 @@ async function pollJob(env: Env, jobId: string): Promise<any> {
 		if (resp.ok) {
 			const containerStatus = (await resp.json()) as any;
 
-			// Container reported failure
+			// Container reported failure — save any partial pages before marking failed
 			if (containerStatus.status === "failed") {
+				await ingestPartialPages(jobId, containerStatus.partial_pages, containerStatus.partial_snapshots, env).catch(() => {});
 				const reason = containerStatus.error || "Container reported failure (no details)";
 				await markJobFailed(env, jobId, reason);
 				return { id: jobId, status: "failed", error: reason };
@@ -443,6 +444,22 @@ async function pollJob(env: Env, jobId: string): Promise<any> {
 					score: containerStatus.results.summary?.score,
 					pages_done: containerStatus.results.pages?.length ?? 0,
 				};
+			}
+
+			// Container restarted and lost state (idle while DB says running)
+			// With disk persistence this shouldn't happen, but if it does, fail fast
+			if (containerStatus.status === "idle") {
+				const reason = "Container restarted and lost crawl state (no persisted results found)";
+				console.warn(`[pollJob] job=${jobId}: ${reason}`);
+				await markJobFailed(env, jobId, reason);
+				return { id: jobId, status: "failed", error: reason };
+			}
+
+			// Ingest partial pages incrementally while crawl is still running
+			if (containerStatus.partial_pages?.length) {
+				await ingestPartialPages(jobId, containerStatus.partial_pages, containerStatus.partial_snapshots, env).catch((err: any) => {
+					console.warn(`[pollJob] Failed to ingest partial pages: ${err.message}`);
+				});
 			}
 
 			// Update progress in DB so we can track it even without polling
@@ -484,6 +501,63 @@ async function markJobFailed(env: Env, jobId: string, error: string): Promise<vo
 		 WHERE id = ? AND status IN ('queued', 'running')`
 	).bind(error, jobId).run();
 	console.error(`[markJobFailed] job=${jobId} error=${error}`);
+}
+
+async function ingestPartialPages(jobId: string, pages: any[], snapshots: any[], env: Env): Promise<number> {
+	if (!pages?.length) return 0;
+
+	const domain =
+		(await env.DB.prepare("SELECT domain FROM crawl_jobs WHERE id = ?")
+			.bind(jobId).first<{ domain: string }>())?.domain || "";
+
+	// Find which URLs are already ingested for this job
+	const existing = await env.DB.prepare(
+		"SELECT url FROM page_audits WHERE job_id = ?"
+	).bind(jobId).all();
+	const existingUrls = new Set((existing.results || []).map((r: any) => r.url));
+
+	// Filter to only new pages
+	const newPages = pages.filter((p: any) => !existingUrls.has(p.url));
+	if (!newPages.length) return 0;
+
+	const stmt = env.DB.prepare(
+		`INSERT INTO page_audits (id, job_id, url, domain, status_code,
+		 title, title_length, title_status, meta_desc, meta_desc_length, meta_desc_status,
+		 h1_count, has_canonical, is_indexable, has_json_ld, has_viewport, has_og_tags,
+		 word_count, images_total, images_no_alt, internal_links, external_links,
+		 mixed_content, response_time_ms, page_weight_bytes, audit_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	);
+
+	const batch = newPages.map((p: any) =>
+		stmt.bind(
+			crypto.randomUUID(), jobId, p.url, domain, p.status_code ?? null,
+			p.title ?? null, p.title_length ?? null, p.title_status ?? null,
+			p.meta_desc ?? null, p.meta_desc_length ?? null, p.meta_desc_status ?? null,
+			p.h1_count ?? 0, p.has_canonical ? 1 : 0, p.is_indexable ? 1 : 0,
+			p.has_json_ld ? 1 : 0, p.has_viewport ? 1 : 0, p.has_og_tags ? 1 : 0,
+			p.word_count ?? 0, p.images_total ?? 0, p.images_no_alt ?? 0,
+			p.internal_links ?? 0, p.external_links ?? 0,
+			p.mixed_content ? 1 : 0,
+			p.response_time_ms ?? null, p.page_weight_bytes ?? 0,
+			p.audit_json ?? "{}"
+		)
+	);
+	await env.DB.batch(batch);
+
+	// Also store snapshots for new pages
+	if (snapshots?.length) {
+		const newUrls = new Set(newPages.map((p: any) => p.url));
+		for (const snap of snapshots) {
+			if (newUrls.has(snap.url)) {
+				const key = `${jobId}/${encodeURIComponent(snap.url)}.html`;
+				await env.SNAPSHOTS.put(key, snap.html);
+			}
+		}
+	}
+
+	console.log(`[ingestPartialPages] job=${jobId}: ingested ${newPages.length} new pages (${existingUrls.size} already existed)`);
+	return newPages.length;
 }
 
 async function expireStaleJobs(env: Env): Promise<number> {
@@ -609,30 +683,9 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 		(await env.DB.prepare("SELECT domain FROM crawl_jobs WHERE id = ?")
 			.bind(jobId).first<{ domain: string }>())?.domain || "";
 
+	// Use deduplicating helper — some pages may already be ingested incrementally
 	if (results.pages?.length) {
-		const stmt = env.DB.prepare(
-			`INSERT INTO page_audits (id, job_id, url, domain, status_code,
-			 title, title_length, title_status, meta_desc, meta_desc_length, meta_desc_status,
-			 h1_count, has_canonical, is_indexable, has_json_ld, has_viewport, has_og_tags,
-			 word_count, images_total, images_no_alt, internal_links, external_links,
-			 mixed_content, response_time_ms, page_weight_bytes, audit_json)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-		);
-
-		const batch = results.pages.map((p: any) =>
-			stmt.bind(
-				crypto.randomUUID(), jobId, p.url, domain, p.status_code ?? null,
-				p.title ?? null, p.title_length ?? null, p.title_status ?? null,
-				p.meta_desc ?? null, p.meta_desc_length ?? null, p.meta_desc_status ?? null,
-				p.h1_count ?? 0, p.has_canonical ? 1 : 0, p.is_indexable ? 1 : 0,
-				p.has_json_ld ? 1 : 0, p.has_viewport ? 1 : 0, p.has_og_tags ? 1 : 0,
-				p.word_count ?? 0, p.images_total ?? 0, p.images_no_alt ?? 0,
-				p.internal_links ?? 0, p.external_links ?? 0,
-				p.mixed_content ? 1 : 0, p.response_time_ms ?? null, p.page_weight_bytes ?? null,
-				p.audit_json ?? "{}"
-			)
-		);
-		await env.DB.batch(batch);
+		await ingestPartialPages(jobId, results.pages, results.snapshots, env);
 	}
 
 	if (results.issues?.length) {
@@ -666,13 +719,6 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 			s.score_breakdown ? JSON.stringify(s.score_breakdown) : null,
 			s.audit_json ?? "{}"
 		).run();
-	}
-
-	if (results.snapshots?.length) {
-		for (const snap of results.snapshots) {
-			const key = `${jobId}/${encodeURIComponent(snap.url)}.html`;
-			await env.SNAPSHOTS.put(key, snap.html);
-		}
 	}
 
 	await env.DB.prepare(

@@ -10,6 +10,7 @@ Endpoints:
     GET  /health   — Liveness check
 """
 
+import os
 import sys
 import json
 import time
@@ -35,6 +36,9 @@ logger = logging.getLogger("seo-container")
 # One crawl per container instance (one container per job)
 
 CRAWL_TIMEOUT_S = 4 * 60  # 4 minutes — must be less than Worker's 5-min job timeout
+PAGE_TIMEOUT_MS = 30_000  # 30s per page navigation
+STATE_FILE = "/tmp/crawl_state.json"
+PAGES_FILE = "/tmp/crawl_pages.json"
 
 state = {
     "status": "idle",       # idle | running | completed | failed
@@ -43,8 +47,75 @@ state = {
     "pages_done": 0,
     "error": None,
     "results": None,        # set when completed
+    "partial_pages": [],    # page payloads persisted incrementally
+    "partial_snapshots": [],
 }
 state_lock = threading.Lock()
+
+
+def _persist_state():
+    """Write terminal state (completed/failed) to disk so it survives container sleep."""
+    try:
+        # Write pages separately (can be large)
+        with open(PAGES_FILE, "w") as f:
+            json.dump({
+                "pages": state.get("partial_pages", []),
+                "snapshots": state.get("partial_snapshots", []),
+            }, f)
+        # Write state without bulky data
+        slim = {k: v for k, v in state.items() if k not in ("partial_pages", "partial_snapshots")}
+        with open(STATE_FILE, "w") as f:
+            json.dump(slim, f)
+        logger.info(f"State persisted to disk (status={state['status']}, pages={len(state.get('partial_pages', []))})")
+    except Exception as e:
+        logger.warning(f"Failed to persist state: {e}")
+
+
+def _load_persisted_state():
+    """Load state from disk if available (after container restart from sleep)."""
+    try:
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                loaded = json.load(f)
+            # Merge pages back in
+            if os.path.exists(PAGES_FILE):
+                with open(PAGES_FILE, "r") as f:
+                    pages_data = json.load(f)
+                loaded["partial_pages"] = pages_data.get("pages", [])
+                loaded["partial_snapshots"] = pages_data.get("snapshots", [])
+            return loaded
+    except Exception as e:
+        logger.warning(f"Failed to load persisted state: {e}")
+    return None
+
+
+def _audit_page_to_payload(page_audit):
+    """Convert a PageAuditResult to the flat dict the Worker expects."""
+    return {
+        "url": page_audit.url,
+        "status_code": page_audit.status_code,
+        "title": page_audit.title.value,
+        "title_length": page_audit.title.length,
+        "title_status": page_audit.title.status.value,
+        "meta_desc": page_audit.meta_description.value,
+        "meta_desc_length": page_audit.meta_description.length,
+        "meta_desc_status": page_audit.meta_description.status.value,
+        "h1_count": page_audit.headings.h1_count,
+        "has_canonical": page_audit.canonical.value is not None,
+        "is_indexable": page_audit.robots.is_indexable,
+        "has_json_ld": page_audit.structured_data.has_json_ld,
+        "has_viewport": page_audit.viewport.status.value == "pass",
+        "has_og_tags": page_audit.open_graph.status.value != "fail",
+        "word_count": page_audit.content.word_count,
+        "images_total": page_audit.images.total,
+        "images_no_alt": page_audit.images.missing_alt,
+        "internal_links": page_audit.links.internal_count,
+        "external_links": page_audit.links.external_count,
+        "mixed_content": page_audit.mixed_content.has_mixed_content,
+        "response_time_ms": page_audit.performance.response_time_ms if page_audit.performance else None,
+        "page_weight_bytes": page_audit.performance.page_weight_bytes if page_audit.performance else None,
+        "audit_json": page_audit.model_dump_json(),
+    }
 
 
 # ─── Crawl Runner (async, runs in background thread) ─────────────────
@@ -61,6 +132,7 @@ def run_crawl_in_thread(job_id: str, url: str, max_pages: int, max_depth: int):
             if state["status"] == "running":
                 state["status"] = "failed"
                 state["error"] = str(e)
+                _persist_state()
     finally:
         loop.close()
         # Safety net: if state is still 'running' after thread exits, mark failed
@@ -69,14 +141,44 @@ def run_crawl_in_thread(job_id: str, url: str, max_pages: int, max_depth: int):
                 logger.error("Crawl thread exited while state still 'running' — marking failed")
                 state["status"] = "failed"
                 state["error"] = state["error"] or "Crawl thread exited unexpectedly"
+                _persist_state()
+
+
+_analyzer = SEOAnalyzer()
 
 
 async def _on_crawl_progress(crawl_state: dict):
-    """Called by BFS strategy after each page is crawled."""
+    """Called by BFS strategy after each page is crawled.
+    Audits the page immediately and persists to disk for incremental D1 ingestion."""
     pages_crawled = crawl_state.get("pages_crawled", 0)
     urls_count = len(crawl_state.get("visited", set()))
+
+    # Audit the last crawled page incrementally
+    last_result = crawl_state.get("last_result")
+    if last_result and last_result.success:
+        try:
+            resp_time = None
+            if hasattr(last_result, "response_time") and last_result.response_time is not None:
+                resp_time = last_result.response_time * 1000
+            page_audit = _analyzer.analyze_page(last_result, response_time_ms=resp_time)
+            payload = _audit_page_to_payload(page_audit)
+            snapshot = {"url": last_result.url, "html": last_result.html[:500_000]} if last_result.html else None
+
+            with state_lock:
+                state["partial_pages"].append(payload)
+                if snapshot:
+                    state["partial_snapshots"].append(snapshot)
+                state["pages_done"] = len(state["partial_pages"])
+                state["pages_found"] = max(urls_count, pages_crawled)
+                _persist_state()
+
+            logger.info(f"Audited+persisted page {len(state['partial_pages'])}/{urls_count}: {last_result.url}")
+            return
+        except Exception as e:
+            logger.warning(f"Failed to audit page {last_result.url}: {e}")
+
     with state_lock:
-        state["pages_done"] = pages_crawled
+        state["pages_done"] = len(state["partial_pages"])
         state["pages_found"] = max(urls_count, pages_crawled)
     logger.info(f"Progress: {pages_crawled} pages crawled, {urls_count} URLs discovered")
 
@@ -85,13 +187,13 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
     logger.info(f"Starting crawl: job={job_id} url={url} max_pages={max_pages}")
     crawl_start = time.time()
 
-    analyzer = SEOAnalyzer()
     parsed_url = urlparse(url)
     domain = parsed_url.netloc
     scheme = parsed_url.scheme or "https"
 
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
+        page_timeout=PAGE_TIMEOUT_MS,
         deep_crawl_strategy=BFSDeepCrawlStrategy(
             max_depth=max_depth,
             max_pages=max_pages,
@@ -99,7 +201,8 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
         ),
     )
 
-    # Wrap crawler in a timeout so it can't hang forever
+    # ── Phase 1: Crawl (per-page audit happens in _on_crawl_progress) ──
+    crawl_results = []
     try:
         async with AsyncWebCrawler() as crawler:
             results = await asyncio.wait_for(
@@ -108,48 +211,34 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
             )
             crawl_results = results if isinstance(results, list) else [results]
     except asyncio.TimeoutError:
-        msg = f"Crawl timed out after {CRAWL_TIMEOUT_S}s"
-        logger.error(msg)
-        with state_lock:
-            state["status"] = "failed"
-            state["error"] = msg
-        return
+        logger.warning(f"Crawl timed out after {CRAWL_TIMEOUT_S}s — using partial results")
     except Exception as e:
-        msg = f"Crawler failed: {e}"
-        logger.error(msg, exc_info=True)
-        with state_lock:
-            state["status"] = "failed"
-            state["error"] = msg
-        return
+        logger.error(f"Crawler failed: {e}", exc_info=True)
 
-    # Validate we actually got results
-    if not crawl_results or all(not cr.success for cr in crawl_results):
-        msg = f"Crawl produced 0 successful pages for {url}"
+    # If we have partial pages from the callback, proceed to site analysis
+    # even if the crawl itself timed out or errored
+    with state_lock:
+        n_pages = len(state["partial_pages"])
+
+    if n_pages == 0:
+        msg = f"Crawl produced 0 audited pages for {url}"
         logger.error(msg)
         with state_lock:
             state["status"] = "failed"
             state["error"] = msg
+            _persist_state()
         return
 
-    with state_lock:
-        state["pages_found"] = len(crawl_results)
+    logger.info(f"Crawl phase done: {n_pages} pages audited, running site-level analysis")
 
-    logger.info(f"Crawled {len(crawl_results)} pages, running SEO audit")
-
-    # Collect response times from CrawlResult metadata (if available)
-    response_times = {}
-    for cr in crawl_results:
-        if hasattr(cr, "response_time") and cr.response_time is not None:
-            response_times[cr.url] = cr.response_time * 1000  # s -> ms
-
-    # Detect broken internal links (failed crawl results = 404s or non-success)
-    crawled_urls = {cr.url for cr in crawl_results if cr.success}
+    # ── Phase 2: Site-level analysis ─────────────────────────────────
+    crawled_urls = {cr.url for cr in crawl_results if cr.success} if crawl_results else set()
     broken_internal_urls = {
         cr.url for cr in crawl_results
         if not cr.success or (cr.status_code and cr.status_code >= 400)
-    }
+    } if crawl_results else set()
 
-    # Run domain-level checks (robots.txt, sitemap.xml)
+    domain_check_result = None
     try:
         domain_check_result = await run_domain_checks(
             domain, crawled_urls=crawled_urls, scheme=scheme
@@ -157,61 +246,46 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
         logger.info("Domain checks completed")
     except Exception as e:
         logger.warning(f"Domain checks failed (non-fatal): {e}")
-        domain_check_result = None
 
     crawl_duration = time.time() - crawl_start
-    crawl_metadata = {
-        "crawl_duration_s": round(crawl_duration, 1),
-    }
+    crawl_metadata = {"crawl_duration_s": round(crawl_duration, 1)}
 
-    # Run SEO audit
-    site_result = analyzer.analyze_site(
-        crawl_results,
-        response_times=response_times,
-        domain_checks=domain_check_result,
-        broken_internal_urls=broken_internal_urls,
-        crawl_metadata=crawl_metadata,
-    )
-    logger.info(f"Audit done. Score: {site_result.summary.score}/100")
+    # Collect response times for site analysis
+    response_times = {}
+    for cr in (crawl_results or []):
+        if hasattr(cr, "response_time") and cr.response_time is not None:
+            response_times[cr.url] = cr.response_time * 1000
 
-    # Build result payload (same shape the Worker expects)
-    pages_payload = []
-    snapshots_payload = []
+    try:
+        site_result = _analyzer.analyze_site(
+            crawl_results or [],
+            response_times=response_times,
+            domain_checks=domain_check_result,
+            broken_internal_urls=broken_internal_urls,
+            crawl_metadata=crawl_metadata,
+        )
+        logger.info(f"Site analysis done. Score: {site_result.summary.score}/100")
+    except Exception as e:
+        logger.error(f"Site-level analysis failed: {e}", exc_info=True)
+        with state_lock:
+            state["status"] = "completed"
+            state["results"] = {
+                "pages": state["partial_pages"],
+                "issues": [],
+                "summary": {
+                    "pages_audited": n_pages,
+                    "score": None,
+                    "issues_critical": 0, "issues_warning": 0, "issues_info": 0,
+                    "score_breakdown": None,
+                    "audit_json": json.dumps({"error": f"Site analysis failed: {e}"}),
+                },
+                "snapshots": state["partial_snapshots"],
+                "domain_checks": None,
+            }
+            _persist_state()
+        return
 
-    for url_key, page_audit in site_result.page_details.items():
-        pages_payload.append({
-            "url": page_audit.url,
-            "status_code": page_audit.status_code,
-            "title": page_audit.title.value,
-            "title_length": page_audit.title.length,
-            "title_status": page_audit.title.status.value,
-            "meta_desc": page_audit.meta_description.value,
-            "meta_desc_length": page_audit.meta_description.length,
-            "meta_desc_status": page_audit.meta_description.status.value,
-            "h1_count": page_audit.headings.h1_count,
-            "has_canonical": page_audit.canonical.value is not None,
-            "is_indexable": page_audit.robots.is_indexable,
-            "has_json_ld": page_audit.structured_data.has_json_ld,
-            "has_viewport": page_audit.viewport.status.value == "pass",
-            "has_og_tags": page_audit.open_graph.status.value != "fail",
-            "word_count": page_audit.content.word_count,
-            "images_total": page_audit.images.total,
-            "images_no_alt": page_audit.images.missing_alt,
-            "internal_links": page_audit.links.internal_count,
-            "external_links": page_audit.links.external_count,
-            "mixed_content": page_audit.mixed_content.has_mixed_content,
-            "response_time_ms": page_audit.performance.response_time_ms,
-            "page_weight_bytes": page_audit.performance.page_weight_bytes,
-            "audit_json": page_audit.model_dump_json(),
-        })
-
-    for cr in crawl_results:
-        if cr.success and cr.html:
-            snapshots_payload.append({
-                "url": cr.url,
-                "html": cr.html[:500_000],
-            })
-
+    # ── Phase 3: Build final payload ─────────────────────────────────
     issues_payload = []
     for issue in site_result.critical + site_result.warnings + site_result.info:
         issues_payload.append({
@@ -234,23 +308,21 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
         "audit_json": json.dumps(summary_dict),
     }
 
-    # Include domain checks in results if available
-    domain_payload = None
-    if domain_check_result:
-        domain_payload = domain_check_result.model_dump()
+    domain_payload = domain_check_result.model_dump() if domain_check_result else None
 
     with state_lock:
         state["status"] = "completed"
-        state["pages_done"] = len(pages_payload)
+        state["pages_done"] = len(state["partial_pages"])
         state["results"] = {
-            "pages": pages_payload,
+            "pages": state["partial_pages"],
             "issues": issues_payload,
             "summary": summary_payload,
-            "snapshots": snapshots_payload,
+            "snapshots": state["partial_snapshots"],
             "domain_checks": domain_payload,
         }
+        _persist_state()
 
-    logger.info(f"Results ready: {len(pages_payload)} pages, {len(issues_payload)} issues")
+    logger.info(f"Results ready: {len(state['partial_pages'])} pages, {len(issues_payload)} issues")
 
 
 # ─── HTTP Request Handler ─────────────────────────────────────────────
@@ -262,16 +334,30 @@ class Handler(BaseHTTPRequestHandler):
 
         elif self.path == "/status":
             with state_lock:
+                current_state = state
+                # If in-memory state is idle, check disk for persisted results
+                if current_state["status"] == "idle":
+                    persisted = _load_persisted_state()
+                    if persisted and persisted.get("status") in ("completed", "failed"):
+                        current_state = persisted
+                        logger.info("Loaded persisted state from disk")
+
                 resp = {
-                    "status": state["status"],
-                    "job_id": state["job_id"],
-                    "pages_found": state["pages_found"],
-                    "pages_done": state["pages_done"],
-                    "error": state["error"],
+                    "status": current_state["status"],
+                    "job_id": current_state.get("job_id"),
+                    "pages_found": current_state.get("pages_found", 0),
+                    "pages_done": current_state.get("pages_done", 0),
+                    "error": current_state.get("error"),
                 }
                 # Include full results when completed (Worker ingests them)
-                if state["status"] == "completed":
-                    resp["results"] = state["results"]
+                if current_state["status"] == "completed":
+                    resp["results"] = current_state.get("results")
+                # Include partial pages while running or on failure (incremental persistence)
+                elif current_state["status"] in ("running", "failed"):
+                    partial = current_state.get("partial_pages", [])
+                    if partial:
+                        resp["partial_pages"] = partial
+                        resp["partial_snapshots"] = current_state.get("partial_snapshots", [])
             self._respond(200, resp)
 
         else:
@@ -293,6 +379,8 @@ class Handler(BaseHTTPRequestHandler):
                 state["pages_done"] = 0
                 state["error"] = None
                 state["results"] = None
+                state["partial_pages"] = []
+                state["partial_snapshots"] = []
 
             # Start crawl in background thread
             t = threading.Thread(
