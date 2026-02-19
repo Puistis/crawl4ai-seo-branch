@@ -34,6 +34,8 @@ logger = logging.getLogger("seo-container")
 # ─── Shared State ─────────────────────────────────────────────────────
 # One crawl per container instance (one container per job)
 
+CRAWL_TIMEOUT_S = 4 * 60  # 4 minutes — must be less than Worker's 5-min job timeout
+
 state = {
     "status": "idle",       # idle | running | completed | failed
     "job_id": None,
@@ -56,10 +58,17 @@ def run_crawl_in_thread(job_id: str, url: str, max_pages: int, max_depth: int):
     except Exception as e:
         logger.error(f"Crawl thread failed: {e}", exc_info=True)
         with state_lock:
-            state["status"] = "failed"
-            state["error"] = str(e)
+            if state["status"] == "running":
+                state["status"] = "failed"
+                state["error"] = str(e)
     finally:
         loop.close()
+        # Safety net: if state is still 'running' after thread exits, mark failed
+        with state_lock:
+            if state["status"] == "running":
+                logger.error("Crawl thread exited while state still 'running' — marking failed")
+                state["status"] = "failed"
+                state["error"] = state["error"] or "Crawl thread exited unexpectedly"
 
 
 async def _on_crawl_progress(crawl_state: dict):
@@ -90,9 +99,37 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
         ),
     )
 
-    async with AsyncWebCrawler() as crawler:
-        results = await crawler.arun(url=url, config=crawl_config)
-        crawl_results = results if isinstance(results, list) else [results]
+    # Wrap crawler in a timeout so it can't hang forever
+    try:
+        async with AsyncWebCrawler() as crawler:
+            results = await asyncio.wait_for(
+                crawler.arun(url=url, config=crawl_config),
+                timeout=CRAWL_TIMEOUT_S,
+            )
+            crawl_results = results if isinstance(results, list) else [results]
+    except asyncio.TimeoutError:
+        msg = f"Crawl timed out after {CRAWL_TIMEOUT_S}s"
+        logger.error(msg)
+        with state_lock:
+            state["status"] = "failed"
+            state["error"] = msg
+        return
+    except Exception as e:
+        msg = f"Crawler failed: {e}"
+        logger.error(msg, exc_info=True)
+        with state_lock:
+            state["status"] = "failed"
+            state["error"] = msg
+        return
+
+    # Validate we actually got results
+    if not crawl_results or all(not cr.success for cr in crawl_results):
+        msg = f"Crawl produced 0 successful pages for {url}"
+        logger.error(msg)
+        with state_lock:
+            state["status"] = "failed"
+            state["error"] = msg
+        return
 
     with state_lock:
         state["pages_found"] = len(crawl_results)
