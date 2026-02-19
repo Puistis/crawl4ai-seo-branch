@@ -7,6 +7,7 @@ Operates on raw HTML + CrawlResult metadata to produce PageAuditResult.
 
 import re
 import json
+import posixpath
 from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse, urljoin
 
@@ -37,6 +38,7 @@ from .models import (
     ViewportCheck,
     LangCheck,
     CharsetCheck,
+    PerformanceCheck,
 )
 
 
@@ -52,20 +54,20 @@ def _parse_html(raw_html: str) -> Optional[HtmlElement]:
 
 
 def check_title(tree: HtmlElement) -> TitleCheck:
-    """Check title tag presence and length (target: 50-60 chars)."""
+    """Check title tag presence and length (target: 30-65 chars)."""
     titles = tree.xpath("//title/text()")
     value = titles[0].strip() if titles else None
     if not value:
         return TitleCheck(status=CheckStatus.FAIL, note="Missing title tag")
 
     length = len(value)
-    if 50 <= length <= 60:
+    if 30 <= length <= 65:
         status, note = CheckStatus.PASS, "Good length"
-    elif 40 <= length < 50:
-        status, note = CheckStatus.WARNING, "Slightly short"
-    elif 60 < length <= 70:
-        status, note = CheckStatus.WARNING, "Slightly long"
-    elif length < 40:
+    elif 20 <= length < 30:
+        status, note = CheckStatus.WARNING, f"Slightly short ({length} chars)"
+    elif 65 < length <= 80:
+        status, note = CheckStatus.WARNING, f"Slightly long ({length} chars)"
+    elif length < 20:
         status, note = CheckStatus.WARNING, f"Too short ({length} chars)"
     else:
         status, note = CheckStatus.WARNING, f"Too long ({length} chars, may be truncated)"
@@ -74,7 +76,7 @@ def check_title(tree: HtmlElement) -> TitleCheck:
 
 
 def check_meta_description(tree: HtmlElement) -> MetaDescriptionCheck:
-    """Check meta description presence and length (target: 150-160 chars)."""
+    """Check meta description presence and length (target: 120-160 chars)."""
     descs = tree.xpath('//meta[@name="description"]/@content')
     value = descs[0].strip() if descs else None
     if not value:
@@ -83,13 +85,13 @@ def check_meta_description(tree: HtmlElement) -> MetaDescriptionCheck:
         )
 
     length = len(value)
-    if 150 <= length <= 160:
+    if 120 <= length <= 160:
         status, note = CheckStatus.PASS, "Good length"
-    elif 120 <= length < 150:
-        status, note = CheckStatus.WARNING, "Slightly short"
+    elif 70 <= length < 120:
+        status, note = CheckStatus.WARNING, f"Slightly short ({length} chars)"
     elif 160 < length <= 200:
-        status, note = CheckStatus.WARNING, "Slightly long"
-    elif length < 120:
+        status, note = CheckStatus.WARNING, f"Slightly long ({length} chars)"
+    elif length < 70:
         status, note = CheckStatus.WARNING, f"Too short ({length} chars)"
     else:
         status, note = CheckStatus.WARNING, f"Too long ({length} chars, will be truncated)"
@@ -220,14 +222,23 @@ def check_headings(tree: HtmlElement) -> HeadingCheck:
 
 def check_images(tree: HtmlElement) -> ImageCheck:
     """
-    Check images for alt text.
-    Ported from seo-audit-mcp extractImages().
+    Check images for alt text, dimensions, modern formats, size, and lazy loading.
+    Ported from seo-audit-mcp extractImages(), extended with optimization checks.
     """
+    MODERN_FORMATS = {".webp", ".avif", ".svg"}
+    LEGACY_PHOTO_FORMATS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
+    OVERSIZED_THRESHOLD = 2000  # pixels — either dimension > 2000 is suspicious
+
     images: List[ImageInfo] = []
     missing_alt = 0
     empty_alt = 0
+    missing_dimensions = 0
+    non_modern_format = 0
+    potentially_oversized = 0
+    missing_lazy_loading = 0
 
-    for img in tree.xpath("//img"):
+    all_imgs = tree.xpath("//img")
+    for idx, img in enumerate(all_imgs):
         src = img.get("src", "") or img.get("data-src", "")
         alt = img.get("alt")
         has_alt = alt is not None
@@ -240,10 +251,37 @@ def check_images(tree: HtmlElement) -> ImageCheck:
         width = _int_or_none(img.get("width"))
         height = _int_or_none(img.get("height"))
 
+        # Alt text checks
         if not has_alt:
             missing_alt += 1
         elif is_empty:
             empty_alt += 1
+
+        # Missing explicit width/height (causes CLS)
+        has_dims = width is not None and height is not None
+        if not has_dims:
+            missing_dimensions += 1
+
+        # Format detection
+        ext = ""
+        if src:
+            path = urlparse(src).path
+            ext = posixpath.splitext(path)[1].lower()
+        is_modern = ext in MODERN_FORMATS or ext not in LEGACY_PHOTO_FORMATS
+        if ext in LEGACY_PHOTO_FORMATS:
+            non_modern_format += 1
+
+        # Potentially oversized
+        is_oversized = False
+        if width and width > OVERSIZED_THRESHOLD or height and height > OVERSIZED_THRESHOLD:
+            is_oversized = True
+            potentially_oversized += 1
+
+        # Missing lazy loading on below-the-fold images (heuristic: not first 2 imgs)
+        needs_lazy = False
+        if idx >= 2 and not is_lazy:
+            needs_lazy = True
+            missing_lazy_loading += 1
 
         images.append(
             ImageInfo(
@@ -253,24 +291,47 @@ def check_images(tree: HtmlElement) -> ImageCheck:
                 is_lazy_loaded=is_lazy,
                 width=width,
                 height=height,
+                missing_dimensions=not has_dims,
+                is_modern_format=is_modern,
+                format_detected=ext.lstrip(".") if ext else "",
+                is_potentially_oversized=is_oversized,
+                needs_lazy_loading=needs_lazy,
             )
         )
 
     total = len(images)
+    issues = []
     if missing_alt > 0:
+        issues.append(f"{missing_alt} missing alt text")
+    if missing_dimensions > 0:
+        issues.append(f"{missing_dimensions} missing width/height")
+    if non_modern_format > 0:
+        issues.append(f"{non_modern_format} non-modern format")
+    if potentially_oversized > 0:
+        issues.append(f"{potentially_oversized} potentially oversized")
+    if missing_lazy_loading > 0:
+        issues.append(f"{missing_lazy_loading} missing lazy loading")
+
+    if missing_alt > 0 or missing_dimensions > 0:
         status = CheckStatus.WARNING
-        note = f"{missing_alt}/{total} images missing alt text"
-    elif empty_alt > 0:
+    elif issues:
         status = CheckStatus.INFO
-        note = f"{empty_alt}/{total} images have empty alt text"
     else:
         status = CheckStatus.PASS
-        note = f"All {total} images have alt text" if total else "No images found"
+
+    if issues:
+        note = f"{total} images: {'; '.join(issues)}"
+    else:
+        note = f"All {total} images optimized" if total else "No images found"
 
     return ImageCheck(
         total=total,
         missing_alt=missing_alt,
         empty_alt=empty_alt,
+        missing_dimensions=missing_dimensions,
+        non_modern_format=non_modern_format,
+        potentially_oversized=potentially_oversized,
+        missing_lazy_loading=missing_lazy_loading,
         images=images,
         status=status,
         note=note,
@@ -281,7 +342,7 @@ def check_links(
     tree: HtmlElement, page_url: str
 ) -> LinkStats:
     """
-    Categorize internal/external/nofollow links.
+    Categorize internal/external/nofollow links and collect URLs.
     Ported from seo-audit-mcp extractLinks().
     """
     parsed_page = urlparse(page_url)
@@ -290,6 +351,8 @@ def check_links(
     internal = 0
     external = 0
     nofollow = 0
+    internal_urls: List[str] = []
+    external_urls: List[str] = []
 
     for a in tree.xpath("//a[@href]"):
         href = (a.get("href") or "").strip()
@@ -305,8 +368,10 @@ def check_links(
 
         if link_domain == page_domain:
             internal += 1
+            internal_urls.append(absolute)
         else:
             external += 1
+            external_urls.append(absolute)
 
     if internal == 0:
         status = CheckStatus.WARNING
@@ -319,6 +384,8 @@ def check_links(
         internal_count=internal,
         external_count=external,
         nofollow_count=nofollow,
+        internal_urls=internal_urls,
+        external_urls=external_urls,
         status=status,
         note=note,
     )
@@ -544,7 +611,11 @@ def check_hreflang(tree: HtmlElement) -> HreflangCheck:
 
 
 def check_content(tree: HtmlElement) -> ContentCheck:
-    """Check page content word count (flag thin content <300 words)."""
+    """Check page content word count (flag thin content <300 words).
+
+    Pages with forms (login, checkout, contact, etc.) use a lower threshold
+    of 100 words since they are inherently transactional.
+    """
     body = tree.xpath("//body")
     if not body:
         return ContentCheck(status=CheckStatus.WARNING, note="No body content found")
@@ -562,8 +633,15 @@ def check_content(tree: HtmlElement) -> ContentCheck:
     text = " ".join(text_parts)
     words = len(text.split())
 
-    if words < 300:
-        status, note = CheckStatus.WARNING, f"Thin content ({words} words, <300)"
+    # Lower threshold for form/transactional pages
+    has_form = bool(tree.xpath("//form"))
+    thin_threshold = 100 if has_form else 300
+
+    if words < thin_threshold:
+        label = f"Thin content ({words} words, <{thin_threshold})"
+        if has_form:
+            label += " — form page"
+        status, note = CheckStatus.WARNING, label
     elif words < 600:
         status, note = CheckStatus.INFO, f"{words} words (consider expanding)"
     else:
@@ -687,10 +765,67 @@ def check_charset(tree: HtmlElement) -> CharsetCheck:
     return CharsetCheck(status=CheckStatus.WARNING, note="No charset declaration found")
 
 
+def check_performance(
+    tree: HtmlElement, raw_html: str, response_time_ms: Optional[float] = None
+) -> PerformanceCheck:
+    """
+    Lightweight performance check based on HTML content.
+    Captures page weight (HTML size), resource count from tags, and optional TTFB.
+    """
+    page_weight = len(raw_html.encode("utf-8", errors="replace"))
+
+    # Count resource tags that imply additional requests
+    resource_selectors = [
+        "//script[@src]",
+        "//link[@rel='stylesheet']",
+        "//img[@src]",
+        "//video[@src]",
+        "//audio[@src]",
+        "//source[@src]",
+        "//iframe[@src]",
+    ]
+    resource_count = sum(len(tree.xpath(sel)) for sel in resource_selectors)
+
+    issues = []
+    if response_time_ms is not None and response_time_ms > 3000:
+        issues.append(f"Slow response ({response_time_ms:.0f}ms)")
+    if page_weight > 3 * 1024 * 1024:  # 3MB
+        issues.append(f"Heavy page ({page_weight / 1024 / 1024:.1f}MB)")
+    elif page_weight > 1 * 1024 * 1024:  # 1MB
+        issues.append(f"Large page ({page_weight / 1024:.0f}KB)")
+    if resource_count > 50:
+        issues.append(f"Many resources ({resource_count})")
+
+    if any("Slow" in i or "Heavy" in i for i in issues):
+        status = CheckStatus.WARNING
+    elif issues:
+        status = CheckStatus.INFO
+    else:
+        status = CheckStatus.PASS
+
+    if issues:
+        note = "; ".join(issues)
+    else:
+        note = f"{page_weight / 1024:.0f}KB, {resource_count} resources"
+
+    return PerformanceCheck(
+        response_time_ms=response_time_ms,
+        page_weight_bytes=page_weight,
+        resource_count=resource_count,
+        status=status,
+        note=note,
+    )
+
+
 # ─── Main Per-Page Audit ──────────────────────────────────────────────
 
 
-def audit_page(url: str, raw_html: str, status_code: Optional[int] = None) -> PageAuditResult:
+def audit_page(
+    url: str,
+    raw_html: str,
+    status_code: Optional[int] = None,
+    response_time_ms: Optional[float] = None,
+) -> PageAuditResult:
     """
     Run all per-page SEO checks on the given HTML.
 
@@ -698,6 +833,7 @@ def audit_page(url: str, raw_html: str, status_code: Optional[int] = None) -> Pa
         url: The page URL.
         raw_html: The full HTML content of the page.
         status_code: HTTP status code (if available).
+        response_time_ms: Optional response time in milliseconds (TTFB).
 
     Returns:
         PageAuditResult with all check results populated.
@@ -730,6 +866,7 @@ def audit_page(url: str, raw_html: str, status_code: Optional[int] = None) -> Pa
         viewport=check_viewport(tree),
         lang=check_lang(tree),
         charset=check_charset(tree),
+        performance=check_performance(tree, raw_html, response_time_ms),
     )
 
 

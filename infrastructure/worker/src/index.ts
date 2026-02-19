@@ -315,12 +315,41 @@ export class SEOAuditMcpAgent extends McpAgent {
 // Shared Business Logic (used by both MCP tools and REST endpoints)
 // ═══════════════════════════════════════════════════════════════════════
 
+async function startContainer(
+	env: Env,
+	containerName: string,
+	jobId: string,
+	url: string,
+	pages: number,
+	depth: number
+): Promise<Response> {
+	const containerId = env.CRAWLER.idFromName(containerName);
+	const container = env.CRAWLER.get(containerId);
+
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 30_000);
+
+	const resp = await container.fetch(
+		new Request("http://container/start", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ job_id: jobId, url, max_pages: pages, max_depth: depth }),
+			signal: controller.signal,
+		})
+	);
+	clearTimeout(timeout);
+	return resp;
+}
+
 async function submitCrawl(
 	env: Env,
 	url: string,
 	maxPages?: number,
 	maxDepth?: number
 ): Promise<{ job_id: string; status: string; domain: string }> {
+	// Proactively clean up stuck jobs before starting a new one
+	await expireStaleJobs(env).catch(() => {});
+
 	const domain = new URL(url).hostname;
 	const jobId = crypto.randomUUID();
 	const pages = maxPages ?? parseInt(env.MAX_PAGES_DEFAULT || "50");
@@ -332,22 +361,17 @@ async function submitCrawl(
 		 VALUES (?, ?, ?, ?, 'queued')`
 	).bind(jobId, domain, url, config).run();
 
-	const containerId = env.CRAWLER.idFromName(jobId);
-	const container = env.CRAWLER.get(containerId);
-
 	try {
-		const controller = new AbortController();
-		const timeout = setTimeout(() => controller.abort(), 30_000); // 30s to start container
+		// First attempt: use jobId as container name (1:1 mapping)
+		let containerResp = await startContainer(env, jobId, jobId, url, pages, depth);
 
-		const containerResp = await container.fetch(
-			new Request("http://container/start", {
-				method: "POST",
-				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({ job_id: jobId, url, max_pages: pages, max_depth: depth }),
-				signal: controller.signal,
-			})
-		);
-		clearTimeout(timeout);
+		// If container returns 500 (stale/stuck DO), retry with a fresh name
+		if (!containerResp.ok && containerResp.status === 500) {
+			const errText = await containerResp.text();
+			console.warn(`[submitCrawl] First container attempt failed (500): ${errText}. Retrying with fresh name...`);
+			const retryName = `${jobId}-retry-${Date.now()}`;
+			containerResp = await startContainer(env, retryName, jobId, url, pages, depth);
+		}
 
 		if (!containerResp.ok) {
 			const errText = await containerResp.text();
@@ -371,6 +395,9 @@ async function submitCrawl(
 }
 
 async function pollJob(env: Env, jobId: string): Promise<any> {
+	// Proactively expire stuck jobs on every poll
+	await expireStaleJobs(env).catch(() => {});
+
 	const job = await env.DB.prepare(
 		"SELECT id, status, score, pages_found, pages_done, error, started_at FROM crawl_jobs WHERE id = ?"
 	).bind(jobId).first();
