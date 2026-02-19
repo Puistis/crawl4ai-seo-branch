@@ -6,8 +6,8 @@ Operates on a collection of PageAuditResult objects to find cross-page issues
 like duplicate titles, orphan pages, deep link structures, etc.
 """
 
-from collections import defaultdict
-from typing import List, Dict, Set, Optional
+from collections import defaultdict, Counter
+from typing import List, Dict, Set, Optional, Any
 from urllib.parse import urlparse
 
 from .models import (
@@ -17,12 +17,18 @@ from .models import (
     SiteIssue,
     SiteAuditSummary,
     SiteAuditResult,
+    CategoryScore,
+    ScoreBreakdown,
+    DomainCheckResult,
 )
 
 
 def run_site_checks(
     page_results: Dict[str, PageAuditResult],
     internal_link_graph: Optional[Dict[str, List[str]]] = None,
+    domain_checks: Optional[DomainCheckResult] = None,
+    broken_internal_urls: Optional[Set[str]] = None,
+    crawl_metadata: Optional[Dict[str, Any]] = None,
 ) -> SiteAuditResult:
     """
     Run all site-wide SEO checks across a set of audited pages.
@@ -30,6 +36,9 @@ def run_site_checks(
     Args:
         page_results: Mapping of URL -> PageAuditResult.
         internal_link_graph: Optional mapping of URL -> list of URLs it links to.
+        domain_checks: Optional domain-level check results (robots.txt, sitemap).
+        broken_internal_urls: Optional set of internal URLs that returned 404.
+        crawl_metadata: Optional dict with crawl timing info (crawl_duration_s, etc.).
 
     Returns:
         SiteAuditResult with summary, issues, and per-page details.
@@ -93,6 +102,37 @@ def run_site_checks(
     if issue:
         warnings.append(issue)
 
+    # ── Image optimization ────────────────────────────────────────────
+    issue = _check_image_optimization(page_results)
+    if issue:
+        (warnings if issue.severity == IssueSeverity.WARNING else info).append(issue)
+
+    # ── Broken internal links ─────────────────────────────────────────
+    if broken_internal_urls:
+        issue = _check_broken_links(page_results, broken_internal_urls)
+        if issue:
+            warnings.append(issue)
+
+    # ── Performance issues ────────────────────────────────────────────
+    issue = _check_slow_pages(page_results)
+    if issue:
+        (warnings if issue.severity == IssueSeverity.WARNING else info).append(issue)
+
+    issue = _check_heavy_pages(page_results)
+    if issue:
+        (warnings if issue.severity == IssueSeverity.WARNING else info).append(issue)
+
+    # ── Domain-level issues (robots.txt, sitemap) ─────────────────────
+    if domain_checks:
+        domain_issues = _check_domain_issues(domain_checks)
+        for di in domain_issues:
+            if di.severity == IssueSeverity.CRITICAL:
+                critical.append(di)
+            elif di.severity == IssueSeverity.WARNING:
+                warnings.append(di)
+            else:
+                info.append(di)
+
     # ── Orphan pages (if link graph available) ────────────────────────
     if internal_link_graph is not None:
         issue = _check_orphan_pages(page_results, internal_link_graph)
@@ -103,13 +143,28 @@ def run_site_checks(
         if issue:
             info.append(issue)
 
-    # ── Compute score and summary ─────────────────────────────────────
+    # ── Compute score breakdown ───────────────────────────────────────
+    breakdown = _compute_score_breakdown(page_results, domain_checks)
+
+    # Total score = sum of all category scores
+    score = sum(
+        getattr(breakdown, field).score
+        for field in breakdown.model_fields
+    )
+
+    # ── Compute pass rates ────────────────────────────────────────────
+    pass_rates = _compute_pass_rates(page_results)
+
+    # ── Top issues summary ────────────────────────────────────────────
+    all_issues = critical + warnings + info
+    top_issues = _compute_top_issues(all_issues)
+
+    # ── Crawl metadata ────────────────────────────────────────────────
+    meta = _compute_crawl_metadata(page_results, crawl_metadata)
+
     n_critical = len(critical)
     n_warning = len(warnings)
     n_info = len(info)
-
-    # Score: start at 100, deduct per issue
-    score = max(0, 100 - (n_critical * 15) - (n_warning * 5) - (n_info * 1))
 
     summary = SiteAuditSummary(
         pages_audited=len(page_results),
@@ -117,6 +172,10 @@ def run_site_checks(
         issues_warning=n_warning,
         issues_info=n_info,
         score=score,
+        score_breakdown=breakdown,
+        pass_rates=pass_rates,
+        top_issues=top_issues,
+        crawl_metadata=meta,
     )
 
     return SiteAuditResult(
@@ -125,6 +184,7 @@ def run_site_checks(
         warnings=warnings,
         info=info,
         page_details=page_results,
+        domain_checks=domain_checks,
     )
 
 
@@ -383,3 +443,350 @@ def _check_deep_pages(
         description=f"{len(deep)} page(s) are >3 clicks from homepage or unreachable via internal links",
         fix="Improve internal linking to keep important pages within 3 clicks of homepage",
     )
+
+
+def _check_image_optimization(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]:
+    """Flag pages with image optimization issues (missing dimensions, non-modern formats)."""
+    affected = [
+        url for url, r in pages.items()
+        if r.images.missing_dimensions > 0 or r.images.non_modern_format > 0
+    ]
+    if not affected:
+        return None
+
+    total_no_dims = sum(r.images.missing_dimensions for r in pages.values())
+    total_legacy = sum(r.images.non_modern_format for r in pages.values())
+    parts = []
+    if total_no_dims:
+        parts.append(f"{total_no_dims} missing width/height")
+    if total_legacy:
+        parts.append(f"{total_legacy} non-modern format")
+
+    return SiteIssue(
+        issue_type="image_optimization",
+        severity=IssueSeverity.WARNING if total_no_dims > 0 else IssueSeverity.INFO,
+        affected_pages=affected,
+        description=f"Image optimization issues across {len(affected)} page(s): {'; '.join(parts)}",
+        fix="Add explicit width/height to images (prevents CLS) and use WebP/AVIF for photos",
+    )
+
+
+def _check_broken_links(
+    pages: Dict[str, PageAuditResult],
+    broken_urls: Set[str],
+) -> Optional[SiteIssue]:
+    """Flag pages that link to broken internal URLs (404s)."""
+    affected = []
+    for url, r in pages.items():
+        page_broken = [u for u in r.links.internal_urls if u in broken_urls]
+        if page_broken:
+            affected.append(url)
+
+    if not affected:
+        return None
+    return SiteIssue(
+        issue_type="broken_internal_links",
+        severity=IssueSeverity.WARNING,
+        affected_pages=affected,
+        description=f"{len(broken_urls)} broken internal link(s) found across {len(affected)} page(s)",
+        fix="Fix or remove links to pages that return 404",
+    )
+
+
+def _check_slow_pages(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]:
+    """Flag pages with response time > 3s."""
+    affected = [
+        url for url, r in pages.items()
+        if r.performance.response_time_ms is not None and r.performance.response_time_ms > 3000
+    ]
+    if not affected:
+        return None
+    return SiteIssue(
+        issue_type="slow_pages",
+        severity=IssueSeverity.WARNING,
+        affected_pages=affected,
+        description=f"{len(affected)} page(s) with response time > 3 seconds",
+        fix="Optimize server response time, enable caching, reduce server-side processing",
+    )
+
+
+def _check_heavy_pages(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]:
+    """Flag pages with page weight > 3MB."""
+    affected = [
+        url for url, r in pages.items()
+        if r.performance.page_weight_bytes > 3 * 1024 * 1024
+    ]
+    if not affected:
+        return None
+    return SiteIssue(
+        issue_type="heavy_pages",
+        severity=IssueSeverity.WARNING,
+        affected_pages=affected,
+        description=f"{len(affected)} page(s) with HTML size > 3MB",
+        fix="Reduce page weight by optimizing images, minifying CSS/JS, and removing unused code",
+    )
+
+
+def _check_domain_issues(dc: DomainCheckResult) -> List[SiteIssue]:
+    """Convert domain check results into SiteIssues."""
+    issues: List[SiteIssue] = []
+
+    # robots.txt
+    r = dc.robots_txt
+    if not r.exists:
+        issues.append(SiteIssue(
+            issue_type="missing_robots_txt",
+            severity=IssueSeverity.WARNING,
+            description="robots.txt not found",
+            fix="Create a robots.txt file to guide search engine crawlers",
+        ))
+    elif r.blocks_important_pages:
+        issues.append(SiteIssue(
+            issue_type="robots_blocks_important",
+            severity=IssueSeverity.CRITICAL,
+            description=f"robots.txt blocks important pages: {', '.join(r.blocked_paths[:5])}",
+            fix="Review Disallow rules in robots.txt to ensure important pages are crawlable",
+        ))
+
+    if r.exists and not r.has_sitemap_reference:
+        issues.append(SiteIssue(
+            issue_type="robots_no_sitemap_ref",
+            severity=IssueSeverity.INFO,
+            description="robots.txt does not reference a sitemap",
+            fix="Add 'Sitemap: https://yourdomain.com/sitemap.xml' to robots.txt",
+        ))
+
+    # sitemap.xml
+    s = dc.sitemap
+    if not s.exists:
+        issues.append(SiteIssue(
+            issue_type="missing_sitemap",
+            severity=IssueSeverity.WARNING,
+            description="sitemap.xml not found",
+            fix="Create a sitemap.xml to help search engines discover your pages",
+        ))
+    elif not s.is_valid_xml:
+        issues.append(SiteIssue(
+            issue_type="invalid_sitemap",
+            severity=IssueSeverity.WARNING,
+            description="sitemap.xml contains invalid XML",
+            fix="Fix XML syntax errors in sitemap.xml",
+        ))
+    elif s.is_too_large:
+        issues.append(SiteIssue(
+            issue_type="sitemap_too_large",
+            severity=IssueSeverity.WARNING,
+            description="sitemap.xml exceeds recommended size (>10MB)",
+            fix="Split sitemap into multiple files using a sitemap index",
+        ))
+
+    if s.crawled_not_in_sitemap:
+        issues.append(SiteIssue(
+            issue_type="pages_not_in_sitemap",
+            severity=IssueSeverity.INFO,
+            affected_pages=s.crawled_not_in_sitemap[:50],
+            description=f"{len(s.crawled_not_in_sitemap)} crawled page(s) not listed in sitemap.xml",
+            fix="Add all important pages to sitemap.xml",
+        ))
+
+    return issues
+
+
+# ─── Scoring & Aggregation Helpers ───────────────────────────────────
+
+
+def _category_score(passed: int, total: int, max_points: int) -> CategoryScore:
+    """Compute a category score based on pass rate."""
+    if total == 0:
+        return CategoryScore(score=max_points, max_score=max_points, pass_rate=1.0, details="N/A")
+    rate = passed / total
+    score = round(rate * max_points)
+    return CategoryScore(
+        score=score,
+        max_score=max_points,
+        pass_rate=round(rate, 3),
+        details=f"{passed}/{total} passed",
+    )
+
+
+def _compute_score_breakdown(
+    pages: Dict[str, PageAuditResult],
+    domain_checks: Optional[DomainCheckResult] = None,
+) -> ScoreBreakdown:
+    """
+    Compute per-category scores. Total budget = 100 points distributed as:
+      titles: 15, meta_descriptions: 10, headings: 10, images: 15,
+      content: 15, technical: 15, structured_data: 5, domain: 10, performance: 5
+    """
+    n = len(pages)
+    results = list(pages.values())
+
+    # Titles (15 pts): pass if status != FAIL
+    titles_pass = sum(1 for r in results if r.title.status != CheckStatus.FAIL)
+    titles = _category_score(titles_pass, n, 15)
+
+    # Meta descriptions (10 pts)
+    meta_pass = sum(1 for r in results if r.meta_description.status != CheckStatus.FAIL)
+    meta = _category_score(meta_pass, n, 10)
+
+    # Headings (10 pts): pass if has at least one H1
+    h1_pass = sum(1 for r in results if r.headings.h1_count >= 1)
+    headings = _category_score(h1_pass, n, 10)
+
+    # Images (15 pts): composite — alt text + dimensions + format
+    if n > 0:
+        img_total = sum(r.images.total for r in results)
+        if img_total > 0:
+            img_ok = img_total - sum(
+                r.images.missing_alt + r.images.missing_dimensions + r.images.non_modern_format
+                for r in results
+            )
+            img_ok = max(0, img_ok)
+            images = _category_score(img_ok, img_total, 15)
+        else:
+            images = CategoryScore(score=15, max_score=15, pass_rate=1.0, details="No images")
+    else:
+        images = _category_score(0, 0, 15)
+
+    # Content (15 pts): pass if word_count >= 300
+    content_pass = sum(1 for r in results if r.content.word_count >= 300)
+    content = _category_score(content_pass, n, 15)
+
+    # Technical (15 pts): composite — canonical, viewport, charset, lang, no mixed content
+    tech_checks_per_page = 5
+    tech_total = n * tech_checks_per_page
+    tech_pass = 0
+    for r in results:
+        if r.canonical.status != CheckStatus.FAIL:
+            tech_pass += 1
+        if r.viewport.status == CheckStatus.PASS:
+            tech_pass += 1
+        if r.charset.status == CheckStatus.PASS:
+            tech_pass += 1
+        if r.lang.status == CheckStatus.PASS:
+            tech_pass += 1
+        if not r.mixed_content.has_mixed_content:
+            tech_pass += 1
+    technical = _category_score(tech_pass, tech_total, 15)
+
+    # Structured data (5 pts)
+    sd_pass = sum(1 for r in results if r.structured_data.has_json_ld or r.structured_data.has_microdata)
+    structured_data = _category_score(sd_pass, n, 5)
+
+    # Domain (10 pts): robots.txt (5) + sitemap (5)
+    if domain_checks:
+        domain_score = 0
+        domain_max = 10
+        domain_parts = []
+        # robots.txt: 5 pts
+        if domain_checks.robots_txt.exists and not domain_checks.robots_txt.blocks_important_pages:
+            domain_score += 5
+            domain_parts.append("robots.txt OK")
+        elif domain_checks.robots_txt.exists:
+            domain_score += 2
+            domain_parts.append("robots.txt blocks important pages")
+        else:
+            domain_parts.append("robots.txt missing")
+        # sitemap: 5 pts
+        if domain_checks.sitemap.exists and domain_checks.sitemap.is_valid_xml:
+            domain_score += 5
+            domain_parts.append("sitemap OK")
+        elif domain_checks.sitemap.exists:
+            domain_score += 2
+            domain_parts.append("sitemap invalid XML")
+        else:
+            domain_parts.append("sitemap missing")
+        domain = CategoryScore(
+            score=domain_score, max_score=domain_max,
+            pass_rate=round(domain_score / domain_max, 3),
+            details="; ".join(domain_parts),
+        )
+    else:
+        domain = CategoryScore(score=10, max_score=10, pass_rate=1.0, details="Not checked")
+
+    # Performance (5 pts): pass if page_weight < 3MB and response_time < 3s
+    perf_pass = sum(
+        1 for r in results
+        if r.performance.page_weight_bytes <= 3 * 1024 * 1024
+        and (r.performance.response_time_ms is None or r.performance.response_time_ms <= 3000)
+    )
+    performance = _category_score(perf_pass, n, 5)
+
+    return ScoreBreakdown(
+        titles=titles,
+        meta_descriptions=meta,
+        headings=headings,
+        images=images,
+        content=content,
+        technical=technical,
+        structured_data=structured_data,
+        domain=domain,
+        performance=performance,
+    )
+
+
+def _compute_pass_rates(pages: Dict[str, PageAuditResult]) -> Dict[str, float]:
+    """Compute pass rates by check type across all pages."""
+    n = len(pages)
+    if n == 0:
+        return {}
+    results = list(pages.values())
+
+    return {
+        "title_pass_rate": round(sum(1 for r in results if r.title.status == CheckStatus.PASS) / n, 3),
+        "meta_desc_pass_rate": round(sum(1 for r in results if r.meta_description.status == CheckStatus.PASS) / n, 3),
+        "h1_pass_rate": round(sum(1 for r in results if r.headings.h1_count >= 1) / n, 3),
+        "canonical_pass_rate": round(sum(1 for r in results if r.canonical.status != CheckStatus.FAIL) / n, 3),
+        "viewport_pass_rate": round(sum(1 for r in results if r.viewport.status == CheckStatus.PASS) / n, 3),
+        "images_alt_pass_rate": round(
+            sum(1 for r in results if r.images.missing_alt == 0) / n, 3
+        ),
+        "structured_data_rate": round(
+            sum(1 for r in results if r.structured_data.has_json_ld or r.structured_data.has_microdata) / n, 3
+        ),
+        "content_sufficient_rate": round(sum(1 for r in results if r.content.word_count >= 300) / n, 3),
+        "no_mixed_content_rate": round(
+            sum(1 for r in results if not r.mixed_content.has_mixed_content) / n, 3
+        ),
+    }
+
+
+def _compute_top_issues(all_issues: List[SiteIssue], limit: int = 5) -> List[Dict[str, Any]]:
+    """Return top N issues sorted by severity then affected count."""
+    severity_order = {IssueSeverity.CRITICAL: 0, IssueSeverity.WARNING: 1, IssueSeverity.INFO: 2}
+    sorted_issues = sorted(
+        all_issues,
+        key=lambda i: (severity_order.get(i.severity, 9), -len(i.affected_pages)),
+    )
+    return [
+        {
+            "issue_type": i.issue_type,
+            "severity": i.severity.value,
+            "affected_count": len(i.affected_pages),
+            "description": i.description,
+        }
+        for i in sorted_issues[:limit]
+    ]
+
+
+def _compute_crawl_metadata(
+    pages: Dict[str, PageAuditResult],
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build crawl metadata dict for the summary."""
+    results = list(pages.values())
+    response_times = [
+        r.performance.response_time_ms for r in results
+        if r.performance.response_time_ms is not None
+    ]
+    avg_response = round(sum(response_times) / len(response_times), 1) if response_times else None
+    total_weight = sum(r.performance.page_weight_bytes for r in results)
+
+    meta: Dict[str, Any] = {
+        "total_pages_found": len(pages),
+        "avg_response_time_ms": avg_response,
+        "total_page_weight_bytes": total_weight,
+    }
+    if extra:
+        meta.update(extra)
+    return meta

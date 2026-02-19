@@ -12,16 +12,19 @@ Endpoints:
 
 import sys
 import json
+import time
 import asyncio
 import logging
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 sys.path.insert(0, "/app")
 
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
 from crawl4ai.seo_audit import SEOAnalyzer
+from crawl4ai.seo_audit.domain_checks import run_domain_checks
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s"
@@ -71,8 +74,12 @@ async def _on_crawl_progress(crawl_state: dict):
 
 async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
     logger.info(f"Starting crawl: job={job_id} url={url} max_pages={max_pages}")
+    crawl_start = time.time()
 
     analyzer = SEOAnalyzer()
+    parsed_url = urlparse(url)
+    domain = parsed_url.netloc
+    scheme = parsed_url.scheme or "https"
 
     crawl_config = CrawlerRunConfig(
         cache_mode=CacheMode.BYPASS,
@@ -92,8 +99,42 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
 
     logger.info(f"Crawled {len(crawl_results)} pages, running SEO audit")
 
+    # Collect response times from CrawlResult metadata (if available)
+    response_times = {}
+    for cr in crawl_results:
+        if hasattr(cr, "response_time") and cr.response_time is not None:
+            response_times[cr.url] = cr.response_time * 1000  # s -> ms
+
+    # Detect broken internal links (failed crawl results = 404s or non-success)
+    crawled_urls = {cr.url for cr in crawl_results if cr.success}
+    broken_internal_urls = {
+        cr.url for cr in crawl_results
+        if not cr.success or (cr.status_code and cr.status_code >= 400)
+    }
+
+    # Run domain-level checks (robots.txt, sitemap.xml)
+    try:
+        domain_check_result = await run_domain_checks(
+            domain, crawled_urls=crawled_urls, scheme=scheme
+        )
+        logger.info("Domain checks completed")
+    except Exception as e:
+        logger.warning(f"Domain checks failed (non-fatal): {e}")
+        domain_check_result = None
+
+    crawl_duration = time.time() - crawl_start
+    crawl_metadata = {
+        "crawl_duration_s": round(crawl_duration, 1),
+    }
+
     # Run SEO audit
-    site_result = analyzer.analyze_site(crawl_results)
+    site_result = analyzer.analyze_site(
+        crawl_results,
+        response_times=response_times,
+        domain_checks=domain_check_result,
+        broken_internal_urls=broken_internal_urls,
+        crawl_metadata=crawl_metadata,
+    )
     logger.info(f"Audit done. Score: {site_result.summary.score}/100")
 
     # Build result payload (same shape the Worker expects)
@@ -122,6 +163,8 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
             "internal_links": page_audit.links.internal_count,
             "external_links": page_audit.links.external_count,
             "mixed_content": page_audit.mixed_content.has_mixed_content,
+            "response_time_ms": page_audit.performance.response_time_ms,
+            "page_weight_bytes": page_audit.performance.page_weight_bytes,
             "audit_json": page_audit.model_dump_json(),
         })
 
@@ -150,8 +193,14 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
         "issues_critical": summary_dict["issues_critical"],
         "issues_warning": summary_dict["issues_warning"],
         "issues_info": summary_dict["issues_info"],
+        "score_breakdown": summary_dict.get("score_breakdown"),
         "audit_json": json.dumps(summary_dict),
     }
+
+    # Include domain checks in results if available
+    domain_payload = None
+    if domain_check_result:
+        domain_payload = domain_check_result.model_dump()
 
     with state_lock:
         state["status"] = "completed"
@@ -161,6 +210,7 @@ async def _crawl(job_id: str, url: str, max_pages: int, max_depth: int):
             "issues": issues_payload,
             "summary": summary_payload,
             "snapshots": snapshots_payload,
+            "domain_checks": domain_payload,
         }
 
     logger.info(f"Results ready: {len(pages_payload)} pages, {len(issues_payload)} issues")

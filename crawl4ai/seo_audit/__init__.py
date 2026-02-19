@@ -22,6 +22,7 @@ Usage:
 from .analyzer import SEOAnalyzer
 from .checks import audit_page
 from .site_checks import run_site_checks
+from .domain_checks import run_domain_checks
 from .models import (
     IssueSeverity,
     CheckStatus,
@@ -50,6 +51,12 @@ from .models import (
     ViewportCheck,
     LangCheck,
     CharsetCheck,
+    PerformanceCheck,
+    CategoryScore,
+    ScoreBreakdown,
+    RobotsTxtCheck,
+    SitemapCheck,
+    DomainCheckResult,
 )
 
 __all__ = [
@@ -57,6 +64,7 @@ __all__ = [
     "SEOAnalyzer",
     "audit_page",
     "run_site_checks",
+    "run_domain_checks",
     # Enums
     "IssueSeverity",
     "CheckStatus",
@@ -83,6 +91,14 @@ __all__ = [
     "ViewportCheck",
     "LangCheck",
     "CharsetCheck",
+    "PerformanceCheck",
+    # Score breakdown
+    "CategoryScore",
+    "ScoreBreakdown",
+    # Domain-level checks
+    "RobotsTxtCheck",
+    "SitemapCheck",
+    "DomainCheckResult",
     # Site-level results
     "SiteAuditResult",
     "SiteAuditSummary",

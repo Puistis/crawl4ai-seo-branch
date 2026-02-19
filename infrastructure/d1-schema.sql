@@ -161,3 +161,52 @@ WHERE pa.title_status IN ('fail', 'warning')
    OR pa.mixed_content = 1
    OR pa.images_no_alt > 0
    OR pa.word_count < 300;
+
+
+-- =============================================================================
+-- Phase 2 Migration — new columns (safe to re-run; D1 ignores duplicate ALTERs)
+-- =============================================================================
+
+-- Performance metrics on page_audits
+-- D1 does not support IF NOT EXISTS on ALTER TABLE, so wrap in a try-catch
+-- pattern at the application level. These are safe to run on fresh schemas
+-- because the CREATE TABLE above does not include them.
+ALTER TABLE page_audits ADD COLUMN response_time_ms REAL;
+ALTER TABLE page_audits ADD COLUMN page_weight_bytes INTEGER DEFAULT 0;
+
+-- Score breakdown JSON on site_summaries
+ALTER TABLE site_summaries ADD COLUMN score_breakdown TEXT;
+
+
+-- ─── Phase 2 Views ──────────────────────────────────────────────────────────
+
+-- Slow or heavy pages
+CREATE VIEW IF NOT EXISTS v_performance_issues AS
+SELECT
+    pa.url,
+    pa.domain,
+    pa.response_time_ms,
+    pa.page_weight_bytes,
+    pa.word_count,
+    pa.images_total,
+    pa.job_id,
+    pa.created_at
+FROM page_audits pa
+WHERE pa.response_time_ms > 3000
+   OR pa.page_weight_bytes > 3145728;
+
+-- Score breakdown per domain (latest audit)
+CREATE VIEW IF NOT EXISTS v_score_breakdown AS
+SELECT
+    s.domain,
+    s.score,
+    s.score_breakdown,
+    s.pages_audited,
+    s.issues_critical,
+    s.issues_warning,
+    s.issues_info,
+    j.completed_at
+FROM site_summaries s
+JOIN crawl_jobs j ON j.id = s.job_id
+WHERE j.status = 'completed'
+ORDER BY s.created_at DESC;

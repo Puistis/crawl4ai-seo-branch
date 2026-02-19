@@ -77,12 +77,21 @@ class ImageInfo(BaseModel):
     is_lazy_loaded: bool = False
     width: Optional[int] = None
     height: Optional[int] = None
+    missing_dimensions: bool = False
+    is_modern_format: bool = True
+    format_detected: str = ""
+    is_potentially_oversized: bool = False
+    needs_lazy_loading: bool = False
 
 
 class ImageCheck(BaseModel):
     total: int = 0
     missing_alt: int = 0
     empty_alt: int = 0
+    missing_dimensions: int = 0
+    non_modern_format: int = 0
+    potentially_oversized: int = 0
+    missing_lazy_loading: int = 0
     images: List[ImageInfo] = Field(default_factory=list)
     status: CheckStatus = CheckStatus.PASS
     note: str = ""
@@ -92,6 +101,8 @@ class LinkStats(BaseModel):
     internal_count: int = 0
     external_count: int = 0
     nofollow_count: int = 0
+    internal_urls: List[str] = Field(default_factory=list)
+    external_urls: List[str] = Field(default_factory=list)
     status: CheckStatus = CheckStatus.PASS
     note: str = ""
 
@@ -187,6 +198,14 @@ class CharsetCheck(BaseModel):
     note: str = ""
 
 
+class PerformanceCheck(BaseModel):
+    response_time_ms: Optional[float] = None
+    page_weight_bytes: int = 0
+    resource_count: int = 0
+    status: CheckStatus = CheckStatus.INFO
+    note: str = ""
+
+
 # ─── Page-Level Audit Result ─────────────────────────────────────────
 
 
@@ -210,6 +229,7 @@ class PageAuditResult(BaseModel):
     viewport: ViewportCheck = Field(default_factory=ViewportCheck)
     lang: LangCheck = Field(default_factory=LangCheck)
     charset: CharsetCheck = Field(default_factory=CharsetCheck)
+    performance: PerformanceCheck = Field(default_factory=PerformanceCheck)
 
     @property
     def critical_issues(self) -> List[str]:
@@ -232,6 +252,36 @@ class PageAuditResult(BaseModel):
         return warns
 
 
+# ─── Domain-Level Check Results ──────────────────────────────────────
+
+
+class RobotsTxtCheck(BaseModel):
+    exists: bool = False
+    has_sitemap_reference: bool = False
+    blocked_paths: List[str] = Field(default_factory=list)
+    blocks_important_pages: bool = False
+    raw_content: Optional[str] = None
+    status: CheckStatus = CheckStatus.INFO
+    note: str = ""
+
+
+class SitemapCheck(BaseModel):
+    exists: bool = False
+    is_valid_xml: bool = False
+    url_count: int = 0
+    urls_in_sitemap: List[str] = Field(default_factory=list)
+    urls_not_in_crawl: List[str] = Field(default_factory=list)
+    crawled_not_in_sitemap: List[str] = Field(default_factory=list)
+    is_too_large: bool = False
+    status: CheckStatus = CheckStatus.INFO
+    note: str = ""
+
+
+class DomainCheckResult(BaseModel):
+    robots_txt: RobotsTxtCheck = Field(default_factory=RobotsTxtCheck)
+    sitemap: SitemapCheck = Field(default_factory=SitemapCheck)
+
+
 # ─── Site-Wide Issue ──────────────────────────────────────────────────
 
 
@@ -243,6 +293,28 @@ class SiteIssue(BaseModel):
     fix: str = ""
 
 
+# ─── Score Breakdown ─────────────────────────────────────────────────
+
+
+class CategoryScore(BaseModel):
+    score: int = 0
+    max_score: int = 0
+    pass_rate: float = 0.0
+    details: str = ""
+
+
+class ScoreBreakdown(BaseModel):
+    titles: CategoryScore = Field(default_factory=CategoryScore)
+    meta_descriptions: CategoryScore = Field(default_factory=CategoryScore)
+    headings: CategoryScore = Field(default_factory=CategoryScore)
+    images: CategoryScore = Field(default_factory=CategoryScore)
+    content: CategoryScore = Field(default_factory=CategoryScore)
+    technical: CategoryScore = Field(default_factory=CategoryScore)
+    structured_data: CategoryScore = Field(default_factory=CategoryScore)
+    domain: CategoryScore = Field(default_factory=CategoryScore)
+    performance: CategoryScore = Field(default_factory=CategoryScore)
+
+
 # ─── Site-Wide Audit Summary ─────────────────────────────────────────
 
 
@@ -252,6 +324,10 @@ class SiteAuditSummary(BaseModel):
     issues_warning: int = 0
     issues_info: int = 0
     score: int = 0  # 0-100
+    score_breakdown: Optional[ScoreBreakdown] = None
+    pass_rates: Dict[str, float] = Field(default_factory=dict)
+    top_issues: List[Dict[str, Any]] = Field(default_factory=list)
+    crawl_metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class SiteAuditResult(BaseModel):
@@ -260,3 +336,4 @@ class SiteAuditResult(BaseModel):
     warnings: List[SiteIssue] = Field(default_factory=list)
     info: List[SiteIssue] = Field(default_factory=list)
     page_details: Dict[str, PageAuditResult] = Field(default_factory=dict)
+    domain_checks: Optional[DomainCheckResult] = None

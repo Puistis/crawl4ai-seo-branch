@@ -169,6 +169,33 @@ export class SEOAuditMcpAgent extends McpAgent {
 					out += `\nCritical Issues: ${summary.issues_critical}`;
 					out += `\nWarnings: ${summary.issues_warning}`;
 					out += `\nInfo: ${summary.issues_info}`;
+
+					// Score breakdown from audit_json
+					try {
+						const audit = JSON.parse(summary.audit_json || "{}");
+						const bd = audit.score_breakdown;
+						if (bd) {
+							out += `\n\n── Score Breakdown ──`;
+							for (const [cat, data] of Object.entries(bd) as [string, any][]) {
+								out += `\n  ${cat}: ${data.score}/${data.max_score} (${(data.pass_rate * 100).toFixed(0)}%)`;
+								if (data.details) out += ` — ${data.details}`;
+							}
+						}
+						const meta = audit.crawl_metadata;
+						if (meta) {
+							out += `\n\n── Crawl Metadata ──`;
+							if (meta.crawl_duration_s != null) out += `\n  Duration: ${meta.crawl_duration_s}s`;
+							if (meta.avg_response_time_ms != null) out += `\n  Avg Response: ${meta.avg_response_time_ms}ms`;
+							if (meta.total_pages_found != null) out += `\n  Total Pages: ${meta.total_pages_found}`;
+						}
+						const topIssues = audit.top_issues;
+						if (topIssues?.length) {
+							out += `\n\n── Top Issues ──`;
+							for (const ti of topIssues) {
+								out += `\n  [${ti.severity}] ${ti.issue_type}: ${ti.description} (${ti.affected_count} affected)`;
+							}
+						}
+					} catch (_) { /* audit_json parse failed, skip breakdown */ }
 				}
 				return { content: [{ type: "text" as const, text: out }] };
 			}
@@ -213,7 +240,9 @@ export class SEOAuditMcpAgent extends McpAgent {
 				if (!pages.length) return { content: [{ type: "text" as const, text: "No pages found." }] };
 
 				const lines = pages.map((p: any) => {
-					let line = `${p.url} (${p.status_code ?? "?"})`;
+					let line = `${p.url} (${p.status_code ?? "?"})`;  
+					if (p.response_time_ms != null) line += ` ${p.response_time_ms}ms`;
+					if (p.page_weight_bytes != null) line += ` ${Math.round(p.page_weight_bytes / 1024)}KB`;
 					line += ` | title: ${p.title_status} | desc: ${p.meta_desc_status} | h1s: ${p.h1_count}`;
 					line += ` | words: ${p.word_count} | imgs w/o alt: ${p.images_no_alt}`;
 					if (p.mixed_content) line += " | MIXED CONTENT";
@@ -559,8 +588,8 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 			 title, title_length, title_status, meta_desc, meta_desc_length, meta_desc_status,
 			 h1_count, has_canonical, is_indexable, has_json_ld, has_viewport, has_og_tags,
 			 word_count, images_total, images_no_alt, internal_links, external_links,
-			 mixed_content, audit_json)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			 mixed_content, response_time_ms, page_weight_bytes, audit_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		);
 
 		const batch = results.pages.map((p: any) =>
@@ -572,7 +601,8 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 				p.has_json_ld ? 1 : 0, p.has_viewport ? 1 : 0, p.has_og_tags ? 1 : 0,
 				p.word_count ?? 0, p.images_total ?? 0, p.images_no_alt ?? 0,
 				p.internal_links ?? 0, p.external_links ?? 0,
-				p.mixed_content ? 1 : 0, p.audit_json ?? "{}"
+				p.mixed_content ? 1 : 0, p.response_time_ms ?? null, p.page_weight_bytes ?? null,
+				p.audit_json ?? "{}"
 			)
 		);
 		await env.DB.batch(batch);
@@ -600,12 +630,13 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 		const s = results.summary;
 		await env.DB.prepare(
 			`INSERT INTO site_summaries (id, job_id, domain, pages_audited, score,
-			 issues_critical, issues_warning, issues_info, audit_json)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			 issues_critical, issues_warning, issues_info, score_breakdown, audit_json)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		).bind(
 			crypto.randomUUID(), jobId, domain,
 			s.pages_audited ?? 0, s.score ?? 0,
 			s.issues_critical ?? 0, s.issues_warning ?? 0, s.issues_info ?? 0,
+			s.score_breakdown ? JSON.stringify(s.score_breakdown) : null,
 			s.audit_json ?? "{}"
 		).run();
 	}
