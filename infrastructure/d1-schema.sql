@@ -61,6 +61,8 @@ CREATE TABLE IF NOT EXISTS page_audits (
     internal_links  INTEGER DEFAULT 0,
     external_links  INTEGER DEFAULT 0,
     mixed_content   INTEGER DEFAULT 0,           -- boolean: 0/1
+    response_time_ms REAL,                        -- page load time in ms
+    page_weight_bytes INTEGER DEFAULT 0,          -- total page weight in bytes
 
     -- Full audit result (all checks, all details)
     audit_json      TEXT NOT NULL,               -- JSON: complete PageAuditResult
@@ -111,9 +113,12 @@ CREATE TABLE IF NOT EXISTS site_summaries (
     issues_warning  INTEGER DEFAULT 0,
     issues_info     INTEGER DEFAULT 0,
     audit_json      TEXT NOT NULL,               -- JSON: complete SiteAuditResult (minus page_details)
+    score_breakdown TEXT,                        -- JSON: per-category score breakdown
+
     created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE INDEX IF NOT EXISTS idx_summaries_job    ON site_summaries(job_id);
 CREATE INDEX IF NOT EXISTS idx_summary_domain ON site_summaries(domain);
 CREATE INDEX IF NOT EXISTS idx_summary_score  ON site_summaries(score);
 
@@ -163,21 +168,6 @@ WHERE pa.title_status IN ('fail', 'warning')
    OR pa.word_count < 300;
 
 
--- =============================================================================
--- Phase 2 Migration — new columns (safe to re-run; D1 ignores duplicate ALTERs)
--- =============================================================================
-
--- Performance metrics on page_audits
--- D1 does not support IF NOT EXISTS on ALTER TABLE, so wrap in a try-catch
--- pattern at the application level. These are safe to run on fresh schemas
--- because the CREATE TABLE above does not include them.
-ALTER TABLE page_audits ADD COLUMN response_time_ms REAL;
-ALTER TABLE page_audits ADD COLUMN page_weight_bytes INTEGER DEFAULT 0;
-
--- Score breakdown JSON on site_summaries
-ALTER TABLE site_summaries ADD COLUMN score_breakdown TEXT;
-
-
 -- ─── Phase 2 Views ──────────────────────────────────────────────────────────
 
 -- Slow or heavy pages
@@ -210,3 +200,112 @@ FROM site_summaries s
 JOIN crawl_jobs j ON j.id = s.job_id
 WHERE j.status = 'completed'
 ORDER BY s.created_at DESC;
+
+
+-- =============================================================================
+-- Phase 3 Migration — Link Graph, Broken Links, Redirect Chains
+-- =============================================================================
+
+-- ─── Link Graph ─────────────────────────────────────────────────────────────
+-- Stores every link relationship discovered during a crawl.
+-- Enables orphan page detection, link depth analysis, and link equity mapping.
+
+CREATE TABLE IF NOT EXISTS link_graph (
+    id          TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL REFERENCES crawl_jobs(id),
+    source_url  TEXT NOT NULL,
+    target_url  TEXT NOT NULL,
+    anchor_text TEXT,
+    is_nofollow INTEGER DEFAULT 0,
+    link_type   TEXT DEFAULT 'internal',  -- 'internal' or 'external'
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_link_graph_job    ON link_graph(job_id);
+CREATE INDEX IF NOT EXISTS idx_link_graph_source ON link_graph(job_id, source_url);
+CREATE INDEX IF NOT EXISTS idx_link_graph_target ON link_graph(job_id, target_url);
+
+
+-- ─── Broken Links ───────────────────────────────────────────────────────────
+-- Stores links that returned 4xx/5xx or timed out during the crawl.
+
+CREATE TABLE IF NOT EXISTS broken_links (
+    id          TEXT PRIMARY KEY,
+    job_id      TEXT NOT NULL REFERENCES crawl_jobs(id),
+    source_url  TEXT NOT NULL,
+    target_url  TEXT NOT NULL,
+    status_code INTEGER,           -- 404, 500, 0 (timeout), etc.
+    anchor_text TEXT,
+    link_type   TEXT DEFAULT 'internal',  -- 'internal' or 'external'
+    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_broken_links_job ON broken_links(job_id);
+
+
+-- ─── Redirect Chains ───────────────────────────────────────────────────────
+-- Stores URLs that went through one or more redirects during the crawl.
+
+CREATE TABLE IF NOT EXISTS redirect_chains (
+    id           TEXT PRIMARY KEY,
+    job_id       TEXT NOT NULL REFERENCES crawl_jobs(id),
+    source_url   TEXT NOT NULL,       -- The URL that was linked to
+    final_url    TEXT NOT NULL,        -- Where it ultimately resolved
+    chain_length INTEGER,             -- Number of redirects (1 = single, 2+ = chain)
+    chain_path   TEXT,                -- JSON array of URLs in the chain
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_redirect_chains_job ON redirect_chains(job_id);
+
+
+-- ─── Lighthouse Scores ─────────────────────────────────────────────────────
+-- Per-URL Lighthouse performance and quality scores.
+-- job_id is NULL for standalone lighthouse_bulk runs, set for crawler-triggered.
+
+CREATE TABLE IF NOT EXISTS lighthouse_scores (
+    id                   TEXT PRIMARY KEY,
+    job_id               TEXT,                          -- NULL for standalone, set for crawler-triggered
+    url                  TEXT NOT NULL,
+    device               TEXT DEFAULT 'mobile',         -- 'mobile' or 'desktop'
+    performance_score    INTEGER,                       -- 0-100
+    accessibility_score  INTEGER,                       -- 0-100
+    best_practices_score INTEGER,                       -- 0-100
+    seo_score            INTEGER,                       -- 0-100
+    lcp_ms               REAL,
+    cls                  REAL,
+    tbt_ms               REAL,
+    fcp_ms               REAL,
+    speed_index_ms       REAL,
+    tti_ms               REAL,
+    diagnostics_json     TEXT,                          -- full Lighthouse diagnostics
+    created_at           TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_lighthouse_job ON lighthouse_scores(job_id);
+CREATE INDEX IF NOT EXISTS idx_lighthouse_url ON lighthouse_scores(url);
+
+
+-- ─── Phase 3 Views ──────────────────────────────────────────────────────────
+
+-- Inbound link counts per page (most linked pages)
+CREATE VIEW IF NOT EXISTS v_inbound_links AS
+SELECT
+    lg.job_id,
+    lg.target_url,
+    COUNT(*) as inbound_count,
+    COUNT(DISTINCT lg.source_url) as unique_sources
+FROM link_graph lg
+WHERE lg.link_type = 'internal'
+GROUP BY lg.job_id, lg.target_url
+ORDER BY inbound_count DESC;
+
+-- Broken links summary per job
+CREATE VIEW IF NOT EXISTS v_broken_links_summary AS
+SELECT
+    bl.job_id,
+    bl.link_type,
+    COUNT(*) as broken_count,
+    COUNT(DISTINCT bl.target_url) as unique_broken_urls
+FROM broken_links bl
+GROUP BY bl.job_id, bl.link_type;

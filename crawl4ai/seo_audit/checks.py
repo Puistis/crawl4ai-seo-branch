@@ -8,6 +8,7 @@ Operates on raw HTML + CrawlResult metadata to produce PageAuditResult.
 import re
 import json
 import posixpath
+from copy import deepcopy
 from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse, urljoin
 
@@ -26,6 +27,7 @@ from .models import (
     ImageCheck,
     ImageInfo,
     LinkStats,
+    LinkDetail,
     OpenGraphCheck,
     TwitterCardCheck,
     StructuredDataCheck,
@@ -76,7 +78,7 @@ def check_title(tree: HtmlElement) -> TitleCheck:
 
 
 def check_meta_description(tree: HtmlElement) -> MetaDescriptionCheck:
-    """Check meta description presence and length (target: 120-160 chars)."""
+    """Check meta description presence and length (target: 50-160 chars)."""
     descs = tree.xpath('//meta[@name="description"]/@content')
     value = descs[0].strip() if descs else None
     if not value:
@@ -85,16 +87,14 @@ def check_meta_description(tree: HtmlElement) -> MetaDescriptionCheck:
         )
 
     length = len(value)
-    if 120 <= length <= 160:
-        status, note = CheckStatus.PASS, "Good length"
-    elif 70 <= length < 120:
-        status, note = CheckStatus.WARNING, f"Slightly short ({length} chars)"
+    if 50 <= length <= 160:
+        status, note = CheckStatus.PASS, f"Good length ({length} chars)"
+    elif length < 50:
+        status, note = CheckStatus.WARNING, f"Too short ({length} chars, aim for 50-160)"
     elif 160 < length <= 200:
-        status, note = CheckStatus.WARNING, f"Slightly long ({length} chars)"
-    elif length < 70:
-        status, note = CheckStatus.WARNING, f"Too short ({length} chars)"
+        status, note = CheckStatus.WARNING, f"Slightly long ({length} chars, may be truncated)"
     else:
-        status, note = CheckStatus.WARNING, f"Too long ({length} chars, will be truncated)"
+        status, note = CheckStatus.WARNING, f"Too long ({length} chars, will be truncated by search engines)"
 
     return MetaDescriptionCheck(value=value, length=length, status=status, note=note)
 
@@ -338,12 +338,26 @@ def check_images(tree: HtmlElement) -> ImageCheck:
     )
 
 
+def _normalize_url(url: str) -> str:
+    """Normalize a URL for consistent storage: lowercase domain, strip fragment, strip trailing slash."""
+    parsed = urlparse(url)
+    # Lowercase the domain, keep path as-is but strip trailing slash and fragment
+    path = parsed.path.rstrip("/") or "/"
+    normalized = parsed._replace(
+        netloc=parsed.netloc.lower(),
+        path=path,
+        fragment="",
+    )
+    return normalized.geturl()
+
+
 def check_links(
     tree: HtmlElement, page_url: str
 ) -> LinkStats:
     """
     Categorize internal/external/nofollow links and collect URLs.
-    Ported from seo-audit-mcp extractLinks().
+    Now also captures per-link details (anchor_text, nofollow, link_type)
+    for the link_graph feature.
     """
     parsed_page = urlparse(page_url)
     page_domain = parsed_page.netloc.lower()
@@ -353,25 +367,46 @@ def check_links(
     nofollow = 0
     internal_urls: List[str] = []
     external_urls: List[str] = []
+    link_details: List[LinkDetail] = []
+    seen_external_domains: Dict[str, str] = {}  # domain -> first URL (dedup externals)
 
     for a in tree.xpath("//a[@href]"):
         href = (a.get("href") or "").strip()
-        if not href or href.startswith("#") or href.startswith("javascript:"):
+        if not href or href.startswith("#") or href.startswith("javascript:") \
+                or href.startswith("mailto:") or href.startswith("tel:"):
             continue
 
         rel = (a.get("rel") or "").lower()
-        if "nofollow" in rel:
+        is_nofollow = "nofollow" in rel
+        if is_nofollow:
             nofollow += 1
 
-        absolute = urljoin(page_url, href)
+        anchor_text = _clean_anchor_text(a)
+
+        absolute = _normalize_url(urljoin(page_url, href))
         link_domain = urlparse(absolute).netloc.lower()
 
         if link_domain == page_domain:
             internal += 1
             internal_urls.append(absolute)
+            link_details.append(LinkDetail(
+                url=absolute,
+                anchor_text=anchor_text,
+                is_nofollow=is_nofollow,
+                link_type="internal",
+            ))
         else:
             external += 1
             external_urls.append(absolute)
+            # For external links in link_details, only store one per unique domain
+            if link_domain not in seen_external_domains:
+                seen_external_domains[link_domain] = absolute
+                link_details.append(LinkDetail(
+                    url=absolute,
+                    anchor_text=anchor_text,
+                    is_nofollow=is_nofollow,
+                    link_type="external",
+                ))
 
     if internal == 0:
         status = CheckStatus.WARNING
@@ -384,8 +419,10 @@ def check_links(
         internal_count=internal,
         external_count=external,
         nofollow_count=nofollow,
+        unique_internal_targets=len(set(internal_urls)),
         internal_urls=internal_urls,
         external_urls=external_urls,
+        link_details=link_details,
         status=status,
         note=note,
     )
@@ -620,17 +657,13 @@ def check_content(tree: HtmlElement) -> ContentCheck:
     if not body:
         return ContentCheck(status=CheckStatus.WARNING, note="No body content found")
 
-    # Remove script and style elements
-    text_parts = []
-    for el in body[0].iter():
-        if el.tag in ("script", "style", "noscript"):
-            continue
-        if el.text:
-            text_parts.append(el.text)
-        if el.tail:
-            text_parts.append(el.tail)
+    # Remove script, style, noscript elements before extracting text
+    body_copy = deepcopy(body[0])
+    for tag in ("script", "style", "noscript"):
+        for el in body_copy.xpath(f".//{tag}"):
+            el.getparent().remove(el)
 
-    text = " ".join(text_parts)
+    text = body_copy.text_content()
     words = len(text.split())
 
     # Lower threshold for form/transactional pages
@@ -766,13 +799,17 @@ def check_charset(tree: HtmlElement) -> CharsetCheck:
 
 
 def check_performance(
-    tree: HtmlElement, raw_html: str, response_time_ms: Optional[float] = None
+    tree: HtmlElement,
+    raw_html: str,
+    response_time_ms: Optional[float] = None,
+    resource_breakdown: Optional[Dict[str, int]] = None,
 ) -> PerformanceCheck:
     """
-    Lightweight performance check based on HTML content.
-    Captures page weight (HTML size), resource count from tags, and optional TTFB.
+    Performance check based on HTML content and optional resource timing data.
+    When resource_breakdown is provided (from Performance Resource Timing API),
+    page_weight_bytes reflects the real total transfer size across all resources.
     """
-    page_weight = len(raw_html.encode("utf-8", errors="replace"))
+    html_weight = len(raw_html.encode("utf-8", errors="replace"))
 
     # Count resource tags that imply additional requests
     resource_selectors = [
@@ -785,6 +822,12 @@ def check_performance(
         "//iframe[@src]",
     ]
     resource_count = sum(len(tree.xpath(sel)) for sel in resource_selectors)
+
+    # Use real total page weight if resource breakdown is available
+    if resource_breakdown:
+        page_weight = sum(resource_breakdown.values())
+    else:
+        page_weight = html_weight
 
     issues = []
     if response_time_ms is not None and response_time_ms > 3000:
@@ -812,6 +855,7 @@ def check_performance(
         response_time_ms=response_time_ms,
         page_weight_bytes=page_weight,
         resource_count=resource_count,
+        resource_breakdown=resource_breakdown,
         status=status,
         note=note,
     )
@@ -825,6 +869,7 @@ def audit_page(
     raw_html: str,
     status_code: Optional[int] = None,
     response_time_ms: Optional[float] = None,
+    resource_breakdown: Optional[Dict[str, int]] = None,
 ) -> PageAuditResult:
     """
     Run all per-page SEO checks on the given HTML.
@@ -834,6 +879,7 @@ def audit_page(
         raw_html: The full HTML content of the page.
         status_code: HTTP status code (if available).
         response_time_ms: Optional response time in milliseconds (TTFB).
+        resource_breakdown: Optional dict of resource type -> bytes from Resource Timing API.
 
     Returns:
         PageAuditResult with all check results populated.
@@ -866,11 +912,30 @@ def audit_page(
         viewport=check_viewport(tree),
         lang=check_lang(tree),
         charset=check_charset(tree),
-        performance=check_performance(tree, raw_html, response_time_ms),
+        performance=check_performance(tree, raw_html, response_time_ms, resource_breakdown),
     )
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────
+
+
+def _clean_anchor_text(a_element) -> str:
+    """Extract clean text from an <a> element, stripping <style> and <script> content."""
+    _SKIP_TAGS = {"style", "script"}
+    parts = []
+    if a_element.text:
+        parts.append(a_element.text)
+    for child in a_element:
+        if child.tag in _SKIP_TAGS:
+            # Skip the element entirely but keep its tail text
+            if child.tail:
+                parts.append(child.tail)
+        else:
+            parts.append(child.text_content() or "")
+            if child.tail:
+                parts.append(child.tail)
+    text = " ".join("".join(parts).split())  # normalize whitespace
+    return text[:200]
 
 
 def _int_or_none(val: Optional[str]) -> Optional[int]:

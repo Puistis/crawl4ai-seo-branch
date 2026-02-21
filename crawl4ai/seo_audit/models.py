@@ -82,6 +82,7 @@ class ImageInfo(BaseModel):
     format_detected: str = ""
     is_potentially_oversized: bool = False
     needs_lazy_loading: bool = False
+    file_size_bytes: Optional[int] = None
 
 
 class ImageCheck(BaseModel):
@@ -97,12 +98,21 @@ class ImageCheck(BaseModel):
     note: str = ""
 
 
+class LinkDetail(BaseModel):
+    url: str = ""
+    anchor_text: str = ""
+    is_nofollow: bool = False
+    link_type: str = "internal"  # 'internal' or 'external'
+
+
 class LinkStats(BaseModel):
     internal_count: int = 0
     external_count: int = 0
     nofollow_count: int = 0
+    unique_internal_targets: int = 0
     internal_urls: List[str] = Field(default_factory=list)
     external_urls: List[str] = Field(default_factory=list)
+    link_details: List[LinkDetail] = Field(default_factory=list)
     status: CheckStatus = CheckStatus.PASS
     note: str = ""
 
@@ -202,8 +212,16 @@ class PerformanceCheck(BaseModel):
     response_time_ms: Optional[float] = None
     page_weight_bytes: int = 0
     resource_count: int = 0
+    resource_breakdown: Optional[Dict[str, int]] = None
     status: CheckStatus = CheckStatus.INFO
     note: str = ""
+
+
+class RedirectChainInfo(BaseModel):
+    source_url: str = ""
+    final_url: str = ""
+    chain_length: int = 0
+    chain_path: List[str] = Field(default_factory=list)
 
 
 # ─── Page-Level Audit Result ─────────────────────────────────────────

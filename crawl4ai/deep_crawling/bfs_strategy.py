@@ -203,22 +203,36 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
 
                 depth = depths.get(page_url, 0)
 
-                # Crawl single page with hard timeout
+                # Crawl single page with hard timeout.
+                # Use explicit task + cancel to handle Playwright not responding
+                # to asyncio cancellation gracefully.
                 try:
-                    page_results = await asyncio.wait_for(
-                        crawler.arun_many(urls=[page_url], config=single_config),
-                        timeout=PER_PAGE_TIMEOUT,
+                    crawl_task = asyncio.ensure_future(
+                        crawler.arun_many(urls=[page_url], config=single_config)
                     )
-                    result = page_results[0] if page_results else None
-                except asyncio.TimeoutError:
-                    self.logger.warning(f"Page timed out after {PER_PAGE_TIMEOUT}s: {page_url}")
-                    result = CrawlResult(
-                        url=page_url,
-                        html="",
-                        success=False,
-                        status_code=0,
-                        error_message=f"Page timed out after {PER_PAGE_TIMEOUT}s",
-                    )
+                    try:
+                        page_results = await asyncio.wait_for(
+                            asyncio.shield(crawl_task),
+                            timeout=PER_PAGE_TIMEOUT,
+                        )
+                        result = page_results[0] if page_results else None
+                    except asyncio.TimeoutError:
+                        self.logger.warning(f"Page timed out after {PER_PAGE_TIMEOUT}s: {page_url}")
+                        # Cancel the underlying task and give it a moment to clean up
+                        crawl_task.cancel()
+                        try:
+                            await asyncio.wait_for(crawl_task, timeout=5)
+                        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                            pass
+                        result = CrawlResult(
+                            url=page_url,
+                            html="",
+                            success=False,
+                            status_code=0,
+                            error_message=f"Page timed out after {PER_PAGE_TIMEOUT}s",
+                        )
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     self.logger.warning(f"Page crawl failed: {page_url}: {e}")
                     result = CrawlResult(

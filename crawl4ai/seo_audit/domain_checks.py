@@ -110,6 +110,55 @@ async def check_robots_txt(
     )
 
 
+async def _fetch_sitemap_urls(
+    sitemap_url: str,
+    session: aiohttp.ClientSession,
+    timeout: int = 15,
+    depth: int = 0,
+) -> List[str]:
+    """Fetch a sitemap (or sitemap index) and return all page URLs.
+    Recursively follows sitemapindex entries up to 2 levels deep."""
+    if depth > 2:
+        return []
+    try:
+        async with session.get(sitemap_url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+            if resp.status != 200:
+                return []
+            content_bytes = await resp.read()
+    except Exception:
+        return []
+
+    try:
+        root = ElementTree.fromstring(content_bytes)
+    except ElementTree.ParseError:
+        return []
+
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    if root.tag.endswith("sitemapindex"):
+        # It's a sitemap index — recursively fetch each child sitemap
+        child_urls = []
+        for sitemap_el in root.findall(f"{ns}sitemap"):
+            loc = sitemap_el.find(f"{ns}loc")
+            if loc is not None and loc.text:
+                child_urls.append(loc.text.strip())
+        all_page_urls: List[str] = []
+        for child_url in child_urls[:50]:  # limit to 50 child sitemaps
+            child_pages = await _fetch_sitemap_urls(child_url, session, timeout, depth + 1)
+            all_page_urls.extend(child_pages)
+        return all_page_urls
+    else:
+        # Regular sitemap — extract page URLs
+        page_urls = []
+        for url_el in root.findall(f"{ns}url"):
+            loc = url_el.find(f"{ns}loc")
+            if loc is not None and loc.text:
+                page_urls.append(loc.text.strip())
+        return page_urls
+
+
 async def check_sitemap(
     domain: str,
     crawled_urls: Optional[Set[str]] = None,
@@ -123,6 +172,7 @@ async def check_sitemap(
     - Existence
     - Valid XML
     - URL count and size
+    - Follows sitemapindex to child sitemaps
     - Cross-reference with crawled URLs (if provided)
     """
     url = f"{scheme}://{domain}/sitemap.xml"
@@ -151,6 +201,7 @@ async def check_sitemap(
     # Parse XML
     sitemap_urls: List[str] = []
     is_valid_xml = False
+    is_index = False
     try:
         root = ElementTree.fromstring(content_bytes)
         is_valid_xml = True
@@ -162,11 +213,10 @@ async def check_sitemap(
 
         # Check for sitemap index
         if root.tag.endswith("sitemapindex"):
-            # It's a sitemap index — extract child sitemap URLs
-            for sitemap_el in root.findall(f"{ns}sitemap"):
-                loc = sitemap_el.find(f"{ns}loc")
-                if loc is not None and loc.text:
-                    sitemap_urls.append(loc.text.strip())
+            is_index = True
+            # Follow child sitemaps to get actual page URLs
+            async with aiohttp.ClientSession() as session:
+                sitemap_urls = await _fetch_sitemap_urls(url, session, timeout)
         else:
             # Regular sitemap — extract page URLs
             for url_el in root.findall(f"{ns}url"):
@@ -183,34 +233,48 @@ async def check_sitemap(
 
     url_count = len(sitemap_urls)
 
-    # Cross-reference with crawled URLs
-    sitemap_set = set(sitemap_urls)
+    # Cross-reference with crawled URLs (normalize trailing slashes for comparison)
+    def _norm(u: str) -> str:
+        from urllib.parse import urlparse as _urlparse
+        p = _urlparse(u)
+        path = p.path.rstrip("/") or "/"
+        return f"{p.scheme}://{p.netloc}{path}"
+
+    sitemap_normalized = {_norm(u) for u in sitemap_urls}
+    crawled_normalized = {_norm(u): u for u in crawled}
+
     urls_not_in_crawl = []
     crawled_not_in_sitemap = []
 
     if crawled:
-        urls_not_in_crawl = [u for u in sitemap_urls if u not in crawled][:50]
-        crawled_not_in_sitemap = [u for u in crawled if u not in sitemap_set][:50]
+        urls_not_in_crawl = [u for u in sitemap_urls if _norm(u) not in crawled_normalized][:50]
+        crawled_not_in_sitemap = [
+            orig for norm, orig in crawled_normalized.items()
+            if norm not in sitemap_normalized
+        ][:50]
 
     issues = []
     if is_too_large:
         issues.append("sitemap too large (>10MB)")
+    if url_count == 0 and is_valid_xml:
+        issues.append("sitemap exists but contains no page URLs")
     if url_count > SITEMAP_URL_LIMIT:
         issues.append(f"too many URLs ({url_count:,})")
     if crawled_not_in_sitemap:
         issues.append(f"{len(crawled_not_in_sitemap)} crawled URL(s) not in sitemap")
 
-    if is_too_large or not is_valid_xml:
+    if is_too_large or not is_valid_xml or url_count == 0:
         status = CheckStatus.WARNING
     elif issues:
         status = CheckStatus.INFO
     else:
         status = CheckStatus.PASS
 
+    index_note = " (via sitemapindex)" if is_index else ""
     if issues:
-        note = f"sitemap.xml: {url_count} URLs; {'; '.join(issues)}"
+        note = f"sitemap.xml{index_note}: {url_count} URLs; {'; '.join(issues)}"
     else:
-        note = f"sitemap.xml valid with {url_count} URLs"
+        note = f"sitemap.xml{index_note} valid with {url_count} URLs"
 
     return SitemapCheck(
         exists=True,

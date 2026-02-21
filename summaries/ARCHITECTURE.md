@@ -1,6 +1,6 @@
 # SEO Audit Platform — Architecture Documentation
 
-**Last updated:** 2026-02-19
+**Last updated:** 2026-02-21
 
 ## Overview
 
@@ -75,8 +75,9 @@ crawl4ai-seo-branch/
    - Persists state to `/tmp/crawl_state.json` for crash recovery
 
 3. **D1 Database** (Cloudflare D1, schema in `infrastructure/d1-schema.sql`)
-   - Tables: `crawl_jobs`, `page_audits`, `site_summaries`, `site_issues`
-   - Views: `v_performance_issues`, `v_score_breakdown`
+   - Core tables: `crawl_jobs`, `page_audits`, `site_summaries`, `site_issues`
+   - Phase 3 tables: `link_graph`, `broken_links`, `redirect_chains`
+   - Views: `v_performance_issues`, `v_score_breakdown`, `v_inbound_links`, `v_broken_links_summary`
 
 4. **R2 Bucket** (`seo-audit-snapshots`)
    - Stores raw HTML snapshots keyed by `{jobId}/{encodedUrl}.html`
@@ -95,10 +96,20 @@ crawl4ai-seo-branch/
    - Appends to `state["partial_pages"]` and persists to disk
 6. **Worker polls** container `/status` periodically via `pollJob`
    - Ingests `partial_pages` into D1 incrementally (deduplicates by URL)
-7. **After crawl completes**, container runs site-level analysis (`analyze_site`)
-   - Domain checks (robots.txt, sitemap, SSL)
-   - Site-wide issues and score calculation
-8. **Worker** ingests final results (issues, summary) into D1, marks job completed
+7. **After crawl completes**, container runs post-crawl analysis:
+   - Domain checks (robots.txt, sitemap, SSL) — 20s timeout
+   - External link checking (HEAD requests, max 100 URLs) — 30s timeout
+   - Cross-references link graph with crawled pages to find broken internal links
+   - Builds broken_links payload (internal + external)
+   - Site-wide issues and score calculation (includes link graph stats, redirect chains, broken links)
+8. **Worker** ingests final results into D1:
+   - Pages → `page_audits` (deduped, batched in chunks of 20)
+   - Issues → `site_issues`
+   - Summary → `site_summaries` (includes `link_graph_stats` in `audit_json`)
+   - Link graph → `link_graph` (batched in chunks of 20 with one-by-one fallback)
+   - Broken links → `broken_links`
+   - Redirect chains → `redirect_chains`
+   - Marks job completed
 
 ### Timeouts
 - **Per-page**: 30 seconds (`PAGE_TIMEOUT_MS = 30_000` in server.py, enforced by `asyncio.wait_for` in `_arun_batch`)
@@ -170,6 +181,42 @@ The schema uses `CREATE TABLE IF NOT EXISTS` and migration-safe `ALTER TABLE` wi
 | Worker API | `infrastructure/worker/src/index.ts` | All API endpoints, job lifecycle, D1 ingestion |
 | DB schema | `infrastructure/d1-schema.sql` | Tables, views, migrations |
 | Wrangler config | `infrastructure/worker/wrangler.toml` | Bindings, env vars |
+
+---
+
+## Phase 3 Features (Link Graph, Broken Links, Redirect Chains)
+
+### Feature 1: Internal Link Graph
+- **Per-page**: `check_links()` in `checks.py` now extracts `LinkDetail` objects (URL, anchor text, nofollow, link type) for every link on each page
+- **URL normalization**: Lowercase domain, strip trailing slash and fragment
+- **External dedup**: Only one external link per unique domain per page stored in `link_details`
+- **Storage**: All link details collected incrementally in `state["partial_link_graph"]` during crawl, then ingested into `link_graph` table
+- **Site analysis**: `_compute_link_graph_stats()` computes orphan pages, link depth distribution, avg internal links per page
+- **Issues**: `orphan_pages` (warning), `deep_pages` (info)
+
+### Feature 2: Broken Link Detection
+- **Internal**: Cross-references `link_graph` entries with crawl results that returned 4xx/5xx status codes
+- **External**: HEAD requests to up to 100 unique external URLs (10s timeout each, 30s total timeout)
+- **Storage**: Results stored in `broken_links` table with source URL, target URL, status code, anchor text, link type
+- **Issues**: `broken_internal_links` (critical), `broken_external_links` (warning)
+
+### Feature 3: Redirect Chain Detection
+- **During crawl**: If `CrawlResult.redirected_url` differs from the original URL, a redirect chain entry is recorded
+- **Storage**: Stored in `redirect_chains` table with source URL, final URL, chain length, chain path (JSON array)
+- **Issues**: `redirect_chains` (warning, 2+ hops), `redirect_loops` (critical, duplicate URLs in chain path)
+
+### Verification Queries
+```sql
+-- Link graph stats
+SELECT COUNT(*) FROM link_graph WHERE job_id = '...';
+SELECT target_url, COUNT(*) as inbound FROM link_graph WHERE job_id = '...' AND link_type = 'internal' GROUP BY target_url ORDER BY inbound DESC;
+
+-- Broken links
+SELECT * FROM broken_links WHERE job_id = '...';
+
+-- Redirect chains
+SELECT * FROM redirect_chains WHERE job_id = '...' AND chain_length >= 2;
+```
 
 ---
 

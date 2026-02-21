@@ -29,6 +29,8 @@ def run_site_checks(
     domain_checks: Optional[DomainCheckResult] = None,
     broken_internal_urls: Optional[Set[str]] = None,
     crawl_metadata: Optional[Dict[str, Any]] = None,
+    broken_external_urls: Optional[Dict[str, int]] = None,
+    redirect_chains: Optional[List[Dict[str, Any]]] = None,
 ) -> SiteAuditResult:
     """
     Run all site-wide SEO checks across a set of audited pages.
@@ -39,6 +41,8 @@ def run_site_checks(
         domain_checks: Optional domain-level check results (robots.txt, sitemap).
         broken_internal_urls: Optional set of internal URLs that returned 404.
         crawl_metadata: Optional dict with crawl timing info (crawl_duration_s, etc.).
+        broken_external_urls: Optional mapping of external URL -> HTTP status code.
+        redirect_chains: Optional list of redirect chain dicts.
 
     Returns:
         SiteAuditResult with summary, issues, and per-page details.
@@ -122,6 +126,10 @@ def run_site_checks(
     if issue:
         (warnings if issue.severity == IssueSeverity.WARNING else info).append(issue)
 
+    issue = _check_heavy_javascript(page_results)
+    if issue:
+        warnings.append(issue)
+
     # ── Domain-level issues (robots.txt, sitemap) ─────────────────────
     if domain_checks:
         domain_issues = _check_domain_issues(domain_checks)
@@ -143,6 +151,23 @@ def run_site_checks(
         if issue:
             info.append(issue)
 
+    # ── Broken external links ─────────────────────────────────────────
+    if broken_external_urls:
+        issue = _check_broken_external_links(page_results, broken_external_urls)
+        if issue:
+            warnings.append(issue)
+
+    # ── Redirect chains ───────────────────────────────────────────────
+    if redirect_chains:
+        chain_issues = _check_redirect_chains(redirect_chains)
+        for ci in chain_issues:
+            if ci.severity == IssueSeverity.CRITICAL:
+                critical.append(ci)
+            elif ci.severity == IssueSeverity.WARNING:
+                warnings.append(ci)
+            else:
+                info.append(ci)
+
     # ── Compute score breakdown ───────────────────────────────────────
     breakdown = _compute_score_breakdown(page_results, domain_checks)
 
@@ -159,8 +184,8 @@ def run_site_checks(
     all_issues = critical + warnings + info
     top_issues = _compute_top_issues(all_issues)
 
-    # ── Crawl metadata ────────────────────────────────────────────────
-    meta = _compute_crawl_metadata(page_results, crawl_metadata)
+    # ── Crawl metadata (includes link graph stats) ────────────────────
+    meta = _compute_crawl_metadata(page_results, crawl_metadata, internal_link_graph)
 
     n_critical = len(critical)
     n_warning = len(warnings)
@@ -511,7 +536,7 @@ def _check_slow_pages(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]:
 
 
 def _check_heavy_pages(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]:
-    """Flag pages with page weight > 3MB."""
+    """Flag pages with total page weight > 3MB."""
     affected = [
         url for url, r in pages.items()
         if r.performance.page_weight_bytes > 3 * 1024 * 1024
@@ -522,8 +547,29 @@ def _check_heavy_pages(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]
         issue_type="heavy_pages",
         severity=IssueSeverity.WARNING,
         affected_pages=affected,
-        description=f"{len(affected)} page(s) with HTML size > 3MB",
+        description=f"{len(affected)} page(s) with total page weight > 3MB",
         fix="Reduce page weight by optimizing images, minifying CSS/JS, and removing unused code",
+    )
+
+
+def _check_heavy_javascript(pages: Dict[str, PageAuditResult]) -> Optional[SiteIssue]:
+    """Flag pages where JavaScript transfer size exceeds 500KB."""
+    js_threshold = 500 * 1024  # 500KB
+    affected = []
+    for url, r in pages.items():
+        bd = r.performance.resource_breakdown
+        if bd:
+            js_bytes = bd.get("script", 0)
+            if js_bytes > js_threshold:
+                affected.append(url)
+    if not affected:
+        return None
+    return SiteIssue(
+        issue_type="heavy_javascript",
+        severity=IssueSeverity.WARNING,
+        affected_pages=affected,
+        description=f"{len(affected)} page(s) with JavaScript bundles > 500KB",
+        fix="Split JavaScript bundles, use code splitting, defer non-critical scripts, and remove unused code",
     )
 
 
@@ -541,10 +587,12 @@ def _check_domain_issues(dc: DomainCheckResult) -> List[SiteIssue]:
             fix="Create a robots.txt file to guide search engine crawlers",
         ))
     elif r.blocks_important_pages:
+        unique_blocked = list(dict.fromkeys(r.blocked_paths[:20]))  # deduplicate, preserve order
         issues.append(SiteIssue(
             issue_type="robots_blocks_important",
             severity=IssueSeverity.CRITICAL,
-            description=f"robots.txt blocks important pages: {', '.join(r.blocked_paths[:5])}",
+            affected_pages=unique_blocked,
+            description=f"robots.txt blocks important pages: {', '.join(unique_blocked[:5])}",
             fix="Review Disallow rules in robots.txt to ensure important pages are crawlable",
         ))
 
@@ -580,7 +628,14 @@ def _check_domain_issues(dc: DomainCheckResult) -> List[SiteIssue]:
             fix="Split sitemap into multiple files using a sitemap index",
         ))
 
-    if s.crawled_not_in_sitemap:
+    if s.url_count == 0 and s.exists and s.is_valid_xml:
+        issues.append(SiteIssue(
+            issue_type="sitemap_empty",
+            severity=IssueSeverity.WARNING,
+            description="sitemap.xml exists but contains no page URLs",
+            fix="Add all important pages to sitemap.xml so search engines can discover them",
+        ))
+    elif s.crawled_not_in_sitemap:
         issues.append(SiteIssue(
             issue_type="pages_not_in_sitemap",
             severity=IssueSeverity.INFO,
@@ -621,12 +676,12 @@ def _compute_score_breakdown(
     n = len(pages)
     results = list(pages.values())
 
-    # Titles (15 pts): pass if status != FAIL
-    titles_pass = sum(1 for r in results if r.title.status != CheckStatus.FAIL)
+    # Titles (15 pts): pass only if status is PASS (good length)
+    titles_pass = sum(1 for r in results if r.title.status == CheckStatus.PASS)
     titles = _category_score(titles_pass, n, 15)
 
-    # Meta descriptions (10 pts)
-    meta_pass = sum(1 for r in results if r.meta_description.status != CheckStatus.FAIL)
+    # Meta descriptions (10 pts): pass only if status is PASS (good length)
+    meta_pass = sum(1 for r in results if r.meta_description.status == CheckStatus.PASS)
     meta = _category_score(meta_pass, n, 10)
 
     # Headings (10 pts): pass if has at least one H1
@@ -772,8 +827,9 @@ def _compute_top_issues(all_issues: List[SiteIssue], limit: int = 5) -> List[Dic
 def _compute_crawl_metadata(
     pages: Dict[str, PageAuditResult],
     extra: Optional[Dict[str, Any]] = None,
+    link_graph: Optional[Dict[str, List[str]]] = None,
 ) -> Dict[str, Any]:
-    """Build crawl metadata dict for the summary."""
+    """Build crawl metadata dict for the summary, including link graph stats."""
     results = list(pages.values())
     response_times = [
         r.performance.response_time_ms for r in results
@@ -789,4 +845,170 @@ def _compute_crawl_metadata(
     }
     if extra:
         meta.update(extra)
+
+    # Link graph stats
+    if link_graph is not None:
+        meta["link_graph_stats"] = _compute_link_graph_stats(pages, link_graph)
+
     return meta
+
+
+def _compute_link_graph_stats(
+    pages: Dict[str, PageAuditResult],
+    link_graph: Dict[str, List[str]],
+) -> Dict[str, Any]:
+    """Compute link graph statistics for the site summary."""
+    total_internal = sum(r.links.internal_count for r in pages.values())
+    total_external = sum(r.links.external_count for r in pages.values())
+    total_unique_targets = sum(r.links.unique_internal_targets for r in pages.values())
+    n_pages = len(pages)
+    avg_internal = round(total_internal / n_pages, 1) if n_pages else 0
+    avg_unique = round(total_unique_targets / n_pages, 1) if n_pages else 0
+
+    # Find orphan pages (no inbound internal links, excluding homepage)
+    # Also count inbound links per page for most_linked_pages
+    inbound_counts: Counter = Counter()
+    linked_to: Set[str] = set()
+    for targets in link_graph.values():
+        linked_to.update(targets)
+        for t in targets:
+            inbound_counts[t] += 1
+    orphan_count = 0
+    for url in pages:
+        parsed = urlparse(url)
+        if parsed.path in ("", "/"):
+            continue
+        if url not in linked_to:
+            orphan_count += 1
+
+    # Top 10 most-linked pages
+    most_linked = [
+        {"url": url, "inbound_links": count}
+        for url, count in inbound_counts.most_common(10)
+    ]
+
+    # BFS from homepage to compute depth distribution
+    homepage = None
+    for url in link_graph:
+        parsed = urlparse(url)
+        if parsed.path in ("", "/"):
+            homepage = url
+            break
+    if not homepage:
+        homepage = next(iter(link_graph), None)
+
+    pages_at_depth: Dict[str, int] = {}
+    max_depth = 0
+    if homepage:
+        depths: Dict[str, int] = {homepage: 0}
+        queue = [homepage]
+        visited_bfs = {homepage}
+        while queue:
+            current = queue.pop(0)
+            d = depths[current]
+            for linked in link_graph.get(current, []):
+                if linked not in visited_bfs and linked in pages:
+                    visited_bfs.add(linked)
+                    depths[linked] = d + 1
+                    queue.append(linked)
+        for d in depths.values():
+            key = str(d)
+            pages_at_depth[key] = pages_at_depth.get(key, 0) + 1
+            if d > max_depth:
+                max_depth = d
+
+    return {
+        "total_internal_links": total_internal,
+        "total_external_links": total_external,
+        "unique_internal_targets": len(linked_to),
+        "orphan_pages": orphan_count,
+        "avg_internal_links_per_page": avg_internal,
+        "avg_unique_targets_per_page": avg_unique,
+        "max_link_depth": max_depth,
+        "pages_at_depth": pages_at_depth,
+        "most_linked_pages": most_linked,
+    }
+
+
+def _check_broken_external_links(
+    pages: Dict[str, PageAuditResult],
+    broken_external: Dict[str, int],
+) -> Optional[SiteIssue]:
+    """Flag pages that link to broken external URLs."""
+    if not broken_external:
+        return None
+
+    # Find which pages link to these broken external URLs
+    affected = []
+    for url, r in pages.items():
+        page_ext_urls = set(r.links.external_urls)
+        if page_ext_urls & set(broken_external.keys()):
+            affected.append(url)
+
+    if not affected:
+        return None
+
+    # Build a per-URL summary: how many pages link to each broken URL
+    url_page_counts: Dict[str, int] = {}
+    for url, r in pages.items():
+        page_ext_urls = set(r.links.external_urls)
+        for broken_url in broken_external:
+            if broken_url in page_ext_urls:
+                url_page_counts[broken_url] = url_page_counts.get(broken_url, 0) + 1
+
+    # Build human-readable summary of broken URLs
+    broken_summaries = []
+    for broken_url, count in sorted(url_page_counts.items(), key=lambda x: -x[1]):
+        domain = urlparse(broken_url).netloc
+        status = broken_external.get(broken_url, 0)
+        status_label = f"HTTP {status}" if status else "timeout"
+        broken_summaries.append(f"{domain} ({status_label}, {count} page{'s' if count != 1 else ''})")
+
+    desc = f"{len(broken_external)} unique broken external URL(s) across {len(affected)} page(s): {'; '.join(broken_summaries[:5])}"
+
+    return SiteIssue(
+        issue_type="broken_external_links",
+        severity=IssueSeverity.WARNING,
+        affected_pages=affected,
+        description=desc,
+        fix="Fix or remove links to external pages that return 404/5xx or time out",
+    )
+
+
+def _check_redirect_chains(
+    chains: List[Dict[str, Any]],
+) -> List[SiteIssue]:
+    """Generate issues from redirect chain data."""
+    issues: List[SiteIssue] = []
+
+    # Redirect chains (2+ hops)
+    long_chains = [c for c in chains if c.get("chain_length", 0) >= 2]
+    if long_chains:
+        affected = [c["source_url"] for c in long_chains]
+        issues.append(SiteIssue(
+            issue_type="redirect_chains",
+            severity=IssueSeverity.WARNING,
+            affected_pages=affected[:50],
+            description=f"{len(long_chains)} URL(s) go through 2+ redirects before resolving",
+            fix="Update links to point directly to the final URL to reduce redirect hops",
+        ))
+
+    # Redirect loops (chain_path contains duplicates, excluding self-referential non-loops)
+    loops = []
+    for c in chains:
+        path = c.get("chain_path", [])
+        # Skip entries where source == final with chain_length <= 1 (not a real loop)
+        if c.get("source_url") == c.get("final_url") and c.get("chain_length", 0) <= 1:
+            continue
+        if len(path) != len(set(path)):
+            loops.append(c["source_url"])
+    if loops:
+        issues.append(SiteIssue(
+            issue_type="redirect_loops",
+            severity=IssueSeverity.CRITICAL,
+            affected_pages=loops[:50],
+            description=f"{len(loops)} URL(s) are caught in redirect loops",
+            fix="Fix the redirect configuration to eliminate circular redirects",
+        ))
+
+    return issues

@@ -112,6 +112,7 @@ export class SEOAuditMcpAgent extends McpAgent {
 			{
 				job_id: z.string().describe("The job UUID from submit_crawl"),
 			},
+			{ readOnlyHint: true },
 			async (args) => {
 				const result = await pollJob(workerEnv, args.job_id);
 				let out = `Job: ${result.id}\nStatus: ${result.status}`;
@@ -137,6 +138,7 @@ export class SEOAuditMcpAgent extends McpAgent {
 				status: z.enum(["queued", "running", "completed", "failed"]).optional().describe("Filter by job status"),
 				limit: z.number().optional().describe("Max results (default: 20, max: 100)"),
 			},
+			{ readOnlyHint: true },
 			async (args) => {
 				const jobs = await listJobs(workerEnv, args.domain, args.status, args.limit);
 				if (!jobs.length) return { content: [{ type: "text" as const, text: "No jobs found matching your criteria." }] };
@@ -155,6 +157,7 @@ export class SEOAuditMcpAgent extends McpAgent {
 			{
 				job_id: z.string().describe("The job UUID"),
 			},
+			{ readOnlyHint: true },
 			async (args) => {
 				const { job, summary } = await getJob(workerEnv, args.job_id);
 				let out = `Job: ${job.id}\nDomain: ${job.domain}\nURL: ${job.start_url}\nStatus: ${job.status}`;
@@ -209,6 +212,7 @@ export class SEOAuditMcpAgent extends McpAgent {
 				job_id: z.string().describe("The job UUID"),
 				severity: z.enum(["critical", "warning", "info"]).optional().describe("Filter by severity level"),
 			},
+			{ readOnlyHint: true },
 			async (args) => {
 				const issues = await getIssues(workerEnv, args.job_id, args.severity);
 				if (!issues.length) return { content: [{ type: "text" as const, text: "No issues found." }] };
@@ -235,6 +239,7 @@ export class SEOAuditMcpAgent extends McpAgent {
 				limit: z.number().optional().describe("Max results (default: 50, max: 200)"),
 				offset: z.number().optional().describe("Offset for pagination (default: 0)"),
 			},
+			{ readOnlyHint: true },
 			async (args) => {
 				const pages = await getPages(workerEnv, args.job_id, args.problems_only, args.limit, args.offset);
 				if (!pages.length) return { content: [{ type: "text" as const, text: "No pages found." }] };
@@ -283,13 +288,44 @@ export class SEOAuditMcpAgent extends McpAgent {
 			}
 		);
 
+		// ── lighthouse_bulk ──────────────────────────────────────
+		this.server.tool(
+			"lighthouse_bulk",
+			"Run Lighthouse performance audits on a list of URLs (max 20). Returns Core Web Vitals, performance score, accessibility, SEO score. Results are stored in the lighthouse_scores table.",
+			{
+				urls: z.array(z.string()).describe("Array of URLs to audit (max 20)"),
+				device: z.enum(["mobile", "desktop"]).optional().describe("Device to emulate (default: mobile)"),
+				concurrency: z.number().optional().describe("Parallel browser instances (default: 3, max: 5)"),
+			},
+			async (args) => {
+				const result = await runLighthouseBulk(workerEnv, args.urls, args.device, args.concurrency);
+				if (result.error) {
+					return { content: [{ type: "text" as const, text: `Error: ${result.error}` }] };
+				}
+				let out = `Lighthouse audit complete: ${result.urls_tested} URL(s) tested`;
+				if (result.urls_failed) out += ` (${result.urls_failed} failed)`;
+				if (result.avg_performance != null) out += `\nAvg Performance: ${result.avg_performance}/100`;
+				if (result.avg_lcp_ms != null) out += `\nAvg LCP: ${result.avg_lcp_ms}ms`;
+				out += `\n\n── Results ──`;
+				for (const r of (result.results || [])) {
+					if (r.error) {
+						out += `\n${r.url}: ERROR — ${r.error}`;
+					} else {
+						out += `\n${r.url}: perf=${r.performance_score} a11y=${r.accessibility_score} seo=${r.seo_score} LCP=${r.lcp_ms ? Math.round(r.lcp_ms) + 'ms' : '?'} CLS=${r.cls ?? '?'} TBT=${r.tbt_ms ? Math.round(r.tbt_ms) + 'ms' : '?'}`;
+					}
+				}
+				return { content: [{ type: "text" as const, text: out }] };
+			}
+		);
+
 		// ── query_db ─────────────────────────────────────────────
 		this.server.tool(
 			"query_db",
-			"Run a read-only SQL query against the SEO audit database. Tables: crawl_jobs, page_audits, site_issues, site_summaries. Views: v_latest_audits, v_critical_issues, v_problem_pages.",
+			"Run a read-only SQL query against the SEO audit database. Tables: crawl_jobs, page_audits, site_issues, site_summaries, link_graph, broken_links, redirect_chains, lighthouse_scores. Views: v_latest_audits, v_critical_issues, v_problem_pages, v_inbound_links, v_broken_links_summary.",
 			{
 				sql: z.string().describe("A SELECT SQL query against the audit database"),
 			},
+			{ readOnlyHint: true },
 			async (args) => {
 				const result = await queryDb(workerEnv, args.sql);
 				if (!result.rows.length) return { content: [{ type: "text" as const, text: "Query returned no results." }] };
@@ -430,14 +466,26 @@ async function pollJob(env: Env, jobId: string): Promise<any> {
 
 			// Container reported failure — save any partial pages before marking failed
 			if (containerStatus.status === "failed") {
-				await ingestPartialPages(jobId, containerStatus.partial_pages, containerStatus.partial_snapshots, env).catch(() => {});
+				await ingestPartialPages(jobId, containerStatus.partial_pages, containerStatus.partial_snapshots, env).catch((err: any) => {
+					console.error(`[pollJob] Failed to ingest partial pages on failure: ${err.message}`, err.stack);
+				});
 				const reason = containerStatus.error || "Container reported failure (no details)";
 				await markJobFailed(env, jobId, reason);
 				return { id: jobId, status: "failed", error: reason };
 			}
 
 			if (containerStatus.status === "completed" && containerStatus.results) {
-				await ingestResults(jobId, containerStatus.results, env);
+				console.log(`[pollJob] job=${jobId}: Container completed. pages=${containerStatus.results.pages?.length ?? 0}, issues=${containerStatus.results.issues?.length ?? 0}, score=${containerStatus.results.summary?.score}`);
+				try {
+					await ingestResults(jobId, containerStatus.results, env);
+					console.log(`[pollJob] job=${jobId}: ingestResults succeeded`);
+				} catch (err: any) {
+					console.error(`[pollJob] job=${jobId}: ingestResults FAILED: ${err.message}`, err.stack);
+					// Still mark as completed with score — ingestResults now handles partial failures internally
+					await env.DB.prepare(
+						`UPDATE crawl_jobs SET status = 'completed', pages_done = ?, score = ?, completed_at = datetime('now') WHERE id = ?`
+					).bind(containerStatus.results.pages?.length ?? 0, containerStatus.results.summary?.score ?? null, jobId).run();
+				}
 				return {
 					id: jobId,
 					status: "completed",
@@ -457,9 +505,12 @@ async function pollJob(env: Env, jobId: string): Promise<any> {
 
 			// Ingest partial pages incrementally while crawl is still running
 			if (containerStatus.partial_pages?.length) {
+				console.log(`[pollJob] job=${jobId}: Ingesting ${containerStatus.partial_pages.length} partial pages...`);
 				await ingestPartialPages(jobId, containerStatus.partial_pages, containerStatus.partial_snapshots, env).catch((err: any) => {
-					console.warn(`[pollJob] Failed to ingest partial pages: ${err.message}`);
+					console.error(`[pollJob] job=${jobId}: Failed to ingest partial pages: ${err.message}`, err.stack);
 				});
+			} else {
+				console.log(`[pollJob] job=${jobId}: status=${containerStatus.status}, pages_done=${containerStatus.pages_done}, partial_pages=${containerStatus.partial_pages?.length ?? 0}`);
 			}
 
 			// Update progress in DB so we can track it even without polling
@@ -520,6 +571,9 @@ async function ingestPartialPages(jobId: string, pages: any[], snapshots: any[],
 	const newPages = pages.filter((p: any) => !existingUrls.has(p.url));
 	if (!newPages.length) return 0;
 
+	// Truncate audit_json to avoid D1 row/batch size limits
+	const MAX_AUDIT_JSON = 50_000; // 50KB per page should be plenty
+
 	const stmt = env.DB.prepare(
 		`INSERT INTO page_audits (id, job_id, url, domain, status_code,
 		 title, title_length, title_status, meta_desc, meta_desc_length, meta_desc_status,
@@ -529,35 +583,78 @@ async function ingestPartialPages(jobId: string, pages: any[], snapshots: any[],
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	);
 
-	const batch = newPages.map((p: any) =>
-		stmt.bind(
-			crypto.randomUUID(), jobId, p.url, domain, p.status_code ?? null,
-			p.title ?? null, p.title_length ?? null, p.title_status ?? null,
-			p.meta_desc ?? null, p.meta_desc_length ?? null, p.meta_desc_status ?? null,
-			p.h1_count ?? 0, p.has_canonical ? 1 : 0, p.is_indexable ? 1 : 0,
-			p.has_json_ld ? 1 : 0, p.has_viewport ? 1 : 0, p.has_og_tags ? 1 : 0,
-			p.word_count ?? 0, p.images_total ?? 0, p.images_no_alt ?? 0,
-			p.internal_links ?? 0, p.external_links ?? 0,
-			p.mixed_content ? 1 : 0,
-			p.response_time_ms ?? null, p.page_weight_bytes ?? 0,
-			p.audit_json ?? "{}"
-		)
-	);
-	await env.DB.batch(batch);
+	// Batch in chunks of 20 to avoid D1 payload limits
+	const CHUNK_SIZE = 20;
+	let ingested = 0;
+	for (let i = 0; i < newPages.length; i += CHUNK_SIZE) {
+		const chunk = newPages.slice(i, i + CHUNK_SIZE);
+		try {
+			const batch = chunk.map((p: any) => {
+				let auditJson = p.audit_json ?? "{}";
+				if (typeof auditJson === "string" && auditJson.length > MAX_AUDIT_JSON) {
+					auditJson = auditJson.substring(0, MAX_AUDIT_JSON);
+				}
+				return stmt.bind(
+					crypto.randomUUID(), jobId, p.url, domain, p.status_code ?? null,
+					p.title ?? null, p.title_length ?? null, p.title_status ?? null,
+					p.meta_desc ?? null, p.meta_desc_length ?? null, p.meta_desc_status ?? null,
+					p.h1_count ?? 0, p.has_canonical ? 1 : 0, p.is_indexable ? 1 : 0,
+					p.has_json_ld ? 1 : 0, p.has_viewport ? 1 : 0, p.has_og_tags ? 1 : 0,
+					p.word_count ?? 0, p.images_total ?? 0, p.images_no_alt ?? 0,
+					p.internal_links ?? 0, p.external_links ?? 0,
+					p.mixed_content ? 1 : 0,
+					p.response_time_ms ?? null, p.page_weight_bytes ?? 0,
+					auditJson
+				);
+			});
+			await env.DB.batch(batch);
+			ingested += chunk.length;
+		} catch (err: any) {
+			console.error(`[ingestPartialPages] job=${jobId}: batch chunk ${i}-${i + chunk.length} FAILED: ${err.message}`, err.stack);
+			// Try inserting one-by-one as fallback
+			for (const p of chunk) {
+				try {
+					let auditJson = p.audit_json ?? "{}";
+					if (typeof auditJson === "string" && auditJson.length > MAX_AUDIT_JSON) {
+						auditJson = auditJson.substring(0, MAX_AUDIT_JSON);
+					}
+					await stmt.bind(
+						crypto.randomUUID(), jobId, p.url, domain, p.status_code ?? null,
+						p.title ?? null, p.title_length ?? null, p.title_status ?? null,
+						p.meta_desc ?? null, p.meta_desc_length ?? null, p.meta_desc_status ?? null,
+						p.h1_count ?? 0, p.has_canonical ? 1 : 0, p.is_indexable ? 1 : 0,
+						p.has_json_ld ? 1 : 0, p.has_viewport ? 1 : 0, p.has_og_tags ? 1 : 0,
+						p.word_count ?? 0, p.images_total ?? 0, p.images_no_alt ?? 0,
+						p.internal_links ?? 0, p.external_links ?? 0,
+						p.mixed_content ? 1 : 0,
+						p.response_time_ms ?? null, p.page_weight_bytes ?? 0,
+						auditJson
+					).run();
+					ingested++;
+				} catch (e2: any) {
+					console.error(`[ingestPartialPages] job=${jobId}: single insert FAILED for ${p.url}: ${e2.message}`);
+				}
+			}
+		}
+	}
 
 	// Also store snapshots for new pages
 	if (snapshots?.length) {
 		const newUrls = new Set(newPages.map((p: any) => p.url));
 		for (const snap of snapshots) {
 			if (newUrls.has(snap.url)) {
-				const key = `${jobId}/${encodeURIComponent(snap.url)}.html`;
-				await env.SNAPSHOTS.put(key, snap.html);
+				try {
+					const key = `${jobId}/${encodeURIComponent(snap.url)}.html`;
+					await env.SNAPSHOTS.put(key, snap.html);
+				} catch (e: any) {
+					console.warn(`[ingestPartialPages] job=${jobId}: snapshot put failed for ${snap.url}: ${e.message}`);
+				}
 			}
 		}
 	}
 
-	console.log(`[ingestPartialPages] job=${jobId}: ingested ${newPages.length} new pages (${existingUrls.size} already existed)`);
-	return newPages.length;
+	console.log(`[ingestPartialPages] job=${jobId}: ingested ${ingested}/${newPages.length} new pages (${existingUrls.size} already existed)`);
+	return ingested;
 }
 
 async function expireStaleJobs(env: Env): Promise<number> {
@@ -675,6 +772,85 @@ async function queryDb(env: Env, sql: string): Promise<{ columns: string[]; rows
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Lighthouse Bulk — runs Lighthouse audits via the container
+// ═══════════════════════════════════════════════════════════════════════
+
+async function runLighthouseBulk(
+	env: Env,
+	urls: string[],
+	device?: string,
+	concurrency?: number
+): Promise<any> {
+	if (!urls?.length) return { error: "urls array is required" };
+	if (urls.length > 20) return { error: "Maximum 20 URLs allowed" };
+
+	// Use a dedicated container for lighthouse (keyed by timestamp to avoid conflicts)
+	const containerName = `lighthouse-${Date.now()}`;
+	const containerId = env.CRAWLER.idFromName(containerName);
+	const container = env.CRAWLER.get(containerId);
+
+	try {
+		const resp = await container.fetch(
+			new Request("http://container/lighthouse", {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					urls,
+					device: device || "mobile",
+					concurrency: Math.min(concurrency || 3, 5),
+				}),
+			})
+		);
+
+		if (!resp.ok) {
+			const errText = await resp.text();
+			return { error: `Container returned HTTP ${resp.status}: ${errText}` };
+		}
+
+		const result = (await resp.json()) as any;
+
+		// Ingest successful results into D1
+		if (result.results?.length) {
+			await ingestLighthouseResults(result.results, result.job_id, env).catch((err: any) => {
+				console.error(`[runLighthouseBulk] Failed to ingest lighthouse results: ${err.message}`);
+			});
+		}
+
+		return result;
+	} catch (err: any) {
+		return { error: `Lighthouse failed: ${err.message}` };
+	}
+}
+
+async function ingestLighthouseResults(results: any[], jobId: string | null, env: Env): Promise<void> {
+	const successResults = results.filter((r: any) => !r.error);
+	if (!successResults.length) return;
+
+	const stmt = env.DB.prepare(
+		`INSERT INTO lighthouse_scores (id, job_id, url, device, performance_score, accessibility_score,
+		 best_practices_score, seo_score, lcp_ms, cls, tbt_ms, fcp_ms, speed_index_ms, tti_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+	);
+
+	const batch = successResults.map((r: any) =>
+		stmt.bind(
+			crypto.randomUUID(), jobId ?? null,
+			r.url, r.device ?? "mobile",
+			r.performance_score ?? null, r.accessibility_score ?? null,
+			r.best_practices_score ?? null, r.seo_score ?? null,
+			r.lcp_ms ?? null, r.cls ?? null, r.tbt_ms ?? null,
+			r.fcp_ms ?? null, r.speed_index_ms ?? null, r.tti_ms ?? null
+		)
+	);
+
+	const CHUNK = 20;
+	for (let i = 0; i < batch.length; i += CHUNK) {
+		await env.DB.batch(batch.slice(i, i + CHUNK));
+	}
+	console.log(`[ingestLighthouseResults] Ingested ${successResults.length} lighthouse scores`);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Result Ingestion — writes container output into D1
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -683,47 +859,186 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 		(await env.DB.prepare("SELECT domain FROM crawl_jobs WHERE id = ?")
 			.bind(jobId).first<{ domain: string }>())?.domain || "";
 
-	// Use deduplicating helper — some pages may already be ingested incrementally
+	const errors: string[] = [];
+
+	// Each section is independent — if one fails, continue with the rest
+
+	// 1. Pages (deduplicating — some may already be ingested incrementally)
 	if (results.pages?.length) {
-		await ingestPartialPages(jobId, results.pages, results.snapshots, env);
+		try {
+			await ingestPartialPages(jobId, results.pages, results.snapshots, env);
+		} catch (err: any) {
+			errors.push(`pages: ${err.message}`);
+			console.error(`[ingestResults] job=${jobId}: pages failed: ${err.message}`);
+		}
 	}
 
+	// 2. Issues
 	if (results.issues?.length) {
-		const stmt = env.DB.prepare(
-			`INSERT INTO site_issues (id, job_id, domain, issue_type, severity,
-			 description, fix, affected_count, affected_urls)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-		);
+		try {
+			const issueStmt = env.DB.prepare(
+				`INSERT INTO site_issues (id, job_id, domain, issue_type, severity,
+				 description, fix, affected_count, affected_urls)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			);
 
-		const batch = results.issues.map((i: any) =>
-			stmt.bind(
-				crypto.randomUUID(), jobId, domain,
-				i.issue_type, i.severity, i.description,
-				i.fix ?? null, i.affected_count ?? 0,
-				JSON.stringify(i.affected_urls ?? [])
-			)
-		);
-		await env.DB.batch(batch);
+			const issueBatch = results.issues.map((i: any) =>
+				issueStmt.bind(
+					crypto.randomUUID(), jobId, domain,
+					i.issue_type, i.severity, i.description,
+					i.fix ?? null, i.affected_count ?? 0,
+					JSON.stringify(i.affected_urls ?? [])
+				)
+			);
+			await env.DB.batch(issueBatch);
+		} catch (err: any) {
+			errors.push(`issues: ${err.message}`);
+			console.error(`[ingestResults] job=${jobId}: issues failed: ${err.message}`);
+		}
 	}
 
+	// 3. Summary
 	if (results.summary) {
-		const s = results.summary;
-		await env.DB.prepare(
-			`INSERT INTO site_summaries (id, job_id, domain, pages_audited, score,
-			 issues_critical, issues_warning, issues_info, score_breakdown, audit_json)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-		).bind(
-			crypto.randomUUID(), jobId, domain,
-			s.pages_audited ?? 0, s.score ?? 0,
-			s.issues_critical ?? 0, s.issues_warning ?? 0, s.issues_info ?? 0,
-			s.score_breakdown ? JSON.stringify(s.score_breakdown) : null,
-			s.audit_json ?? "{}"
-		).run();
+		try {
+			const s = results.summary;
+			const auditJsonValue = typeof s.audit_json === "string" ? s.audit_json.substring(0, 100_000) : JSON.stringify(s).substring(0, 100_000);
+			await env.DB.prepare(
+				`INSERT INTO site_summaries (id, job_id, domain, pages_audited, score,
+				 issues_critical, issues_warning, issues_info, score_breakdown, audit_json)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			).bind(
+				crypto.randomUUID(), jobId, domain,
+				s.pages_audited ?? 0, s.score ?? 0,
+				s.issues_critical ?? 0, s.issues_warning ?? 0, s.issues_info ?? 0,
+				s.score_breakdown ? JSON.stringify(s.score_breakdown) : null,
+				auditJsonValue
+			).run();
+		} catch (err: any) {
+			errors.push(`summary: ${err.message}`);
+			console.error(`[ingestResults] job=${jobId}: summary failed: ${err.message}`);
+		}
 	}
 
+	// 4. Link Graph (deduplicate by source_url + target_url + link_type)
+	if (results.link_graph?.length) {
+		try {
+			const lgStmt = env.DB.prepare(
+				`INSERT INTO link_graph (id, job_id, source_url, target_url, anchor_text, is_nofollow, link_type)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+			);
+			const seen = new Set<string>();
+			const dedupedLg = results.link_graph.filter((lg: any) => {
+				const key = `${lg.source_url}|${lg.target_url}|${lg.link_type ?? "internal"}`;
+				if (seen.has(key)) return false;
+				seen.add(key);
+				return true;
+			});
+			console.log(`[ingestResults] job=${jobId}: link_graph deduped ${results.link_graph.length} -> ${dedupedLg.length}`);
+			const CHUNK = 20;
+			let lgIngested = 0;
+			for (let i = 0; i < dedupedLg.length; i += CHUNK) {
+				const chunk = dedupedLg.slice(i, i + CHUNK);
+				try {
+					const batch = chunk.map((lg: any) =>
+						lgStmt.bind(
+							crypto.randomUUID(), jobId,
+							lg.source_url, lg.target_url,
+							(lg.anchor_text ?? "").substring(0, 200),
+							lg.is_nofollow ? 1 : 0,
+							lg.link_type ?? "internal"
+						)
+					);
+					await env.DB.batch(batch);
+					lgIngested += chunk.length;
+				} catch (batchErr: any) {
+					console.error(`[ingestResults] job=${jobId}: link_graph batch ${i} failed: ${batchErr.message}`);
+					for (const lg of chunk) {
+						try {
+							await lgStmt.bind(
+								crypto.randomUUID(), jobId,
+								lg.source_url, lg.target_url,
+								(lg.anchor_text ?? "").substring(0, 200),
+								lg.is_nofollow ? 1 : 0,
+								lg.link_type ?? "internal"
+							).run();
+							lgIngested++;
+						} catch (e2: any) {
+							console.error(`[ingestResults] job=${jobId}: link_graph single insert failed: ${e2.message}`);
+						}
+					}
+				}
+			}
+			console.log(`[ingestResults] job=${jobId}: link_graph ingested ${lgIngested}/${results.link_graph.length}`);
+		} catch (err: any) {
+			errors.push(`link_graph: ${err.message}`);
+			console.error(`[ingestResults] job=${jobId}: link_graph failed: ${err.message}`);
+		}
+	}
+
+	// 5. Broken Links
+	if (results.broken_links?.length) {
+		try {
+			const blStmt = env.DB.prepare(
+				`INSERT INTO broken_links (id, job_id, source_url, target_url, status_code, anchor_text, link_type)
+				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+			);
+			const batch = results.broken_links.map((bl: any) =>
+				blStmt.bind(
+					crypto.randomUUID(), jobId,
+					bl.source_url, bl.target_url,
+					bl.status_code ?? null,
+					(bl.anchor_text ?? "").substring(0, 200),
+					bl.link_type ?? "internal"
+				)
+			);
+			// Broken links are typically small, batch all at once
+			const CHUNK = 20;
+			for (let i = 0; i < batch.length; i += CHUNK) {
+				await env.DB.batch(batch.slice(i, i + CHUNK));
+			}
+			console.log(`[ingestResults] job=${jobId}: broken_links ingested ${results.broken_links.length}`);
+		} catch (err: any) {
+			errors.push(`broken_links: ${err.message}`);
+			console.error(`[ingestResults] job=${jobId}: broken_links failed: ${err.message}`);
+		}
+	}
+
+	// 6. Redirect Chains
+	if (results.redirect_chains?.length) {
+		try {
+			const rcStmt = env.DB.prepare(
+				`INSERT INTO redirect_chains (id, job_id, source_url, final_url, chain_length, chain_path)
+				 VALUES (?, ?, ?, ?, ?, ?)`
+			);
+			const batch = results.redirect_chains.map((rc: any) =>
+				rcStmt.bind(
+					crypto.randomUUID(), jobId,
+					rc.source_url, rc.final_url,
+					rc.chain_length ?? 1,
+					JSON.stringify(rc.chain_path ?? [])
+				)
+			);
+			const CHUNK = 20;
+			for (let i = 0; i < batch.length; i += CHUNK) {
+				await env.DB.batch(batch.slice(i, i + CHUNK));
+			}
+			console.log(`[ingestResults] job=${jobId}: redirect_chains ingested ${results.redirect_chains.length}`);
+		} catch (err: any) {
+			errors.push(`redirect_chains: ${err.message}`);
+			console.error(`[ingestResults] job=${jobId}: redirect_chains failed: ${err.message}`);
+		}
+	}
+
+	// 7. Update job status + score — store errors only if any occurred
 	await env.DB.prepare(
-		`UPDATE crawl_jobs SET status = 'completed', pages_done = ?, score = ?, completed_at = datetime('now') WHERE id = ?`
-	).bind(results.pages?.length ?? 0, results.summary?.score ?? null, jobId).run();
+		`UPDATE crawl_jobs SET status = 'completed', pages_done = ?, score = ?, error = ?, completed_at = datetime('now') WHERE id = ?`
+	).bind(
+		results.pages?.length ?? 0,
+		results.summary?.score ?? null,
+		errors.length ? errors.join('; ') : null,
+		jobId
+	).run();
+	console.log(`[ingestResults] job=${jobId}: completed, score=${results.summary?.score}, errors=${errors.length}`);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -843,6 +1158,12 @@ export default {
 				if (!sql) return json({ error: "sql parameter required" }, 400);
 				const result = await queryDb(env, sql);
 				return json({ ...result, count: result.rows.length });
+			}
+
+			if (method === "POST" && path === "/lighthouse") {
+				const body = (await request.json()) as { urls: string[]; device?: string; concurrency?: number };
+				const result = await runLighthouseBulk(env, body.urls, body.device, body.concurrency);
+				return json(result, result.error && !result.urls_tested ? 400 : 200);
 			}
 
 			return json({ error: "Not found" }, 404);

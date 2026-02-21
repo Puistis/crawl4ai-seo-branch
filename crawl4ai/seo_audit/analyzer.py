@@ -37,7 +37,10 @@ class SEOAnalyzer:
     """
 
     def analyze_page(
-        self, crawl_result: CrawlResult, response_time_ms: Optional[float] = None
+        self,
+        crawl_result: CrawlResult,
+        response_time_ms: Optional[float] = None,
+        resource_breakdown: Optional[Dict[str, int]] = None,
     ) -> PageAuditResult:
         """
         Run all SEO checks on a single crawled page.
@@ -45,6 +48,7 @@ class SEOAnalyzer:
         Args:
             crawl_result: A CrawlResult from crawl4ai's crawler.
             response_time_ms: Optional response time in milliseconds.
+            resource_breakdown: Optional dict of resource type -> bytes from Resource Timing API.
 
         Returns:
             PageAuditResult with all per-page SEO checks.
@@ -55,6 +59,7 @@ class SEOAnalyzer:
             raw_html=html,
             status_code=crawl_result.status_code,
             response_time_ms=response_time_ms,
+            resource_breakdown=resource_breakdown,
         )
 
     def analyze_site(
@@ -64,6 +69,9 @@ class SEOAnalyzer:
         domain_checks: Optional[DomainCheckResult] = None,
         broken_internal_urls: Optional[Set[str]] = None,
         crawl_metadata: Optional[Dict[str, Any]] = None,
+        broken_external_urls: Optional[Dict[str, int]] = None,
+        redirect_chains: Optional[List[Dict[str, Any]]] = None,
+        internal_link_graph: Optional[Dict[str, List[str]]] = None,
     ) -> SiteAuditResult:
         """
         Run full site-wide SEO audit across multiple crawled pages.
@@ -74,25 +82,48 @@ class SEOAnalyzer:
             domain_checks: Optional domain-level check results.
             broken_internal_urls: Optional set of internal URLs that returned 404.
             crawl_metadata: Optional dict with crawl timing info.
+            broken_external_urls: Optional mapping of external URL -> HTTP status code.
+            redirect_chains: Optional list of redirect chain dicts.
+            internal_link_graph: Optional pre-built link graph (source URL -> target URLs).
+                If provided, overrides the link graph built from crawl_results.
 
         Returns:
             SiteAuditResult with summary, issues, and per-page details.
         """
         page_results: Dict[str, PageAuditResult] = {}
-        link_graph: Dict[str, List[str]] = {}
+        link_graph: Dict[str, List[str]] = internal_link_graph or {}
         times = response_times or {}
 
         for result in crawl_results:
             if not result.success:
                 continue
 
+            # Extract resource breakdown + response time from JS execution result
+            resp_time = times.get(result.url)
+            resource_breakdown = None
+            js_result = getattr(result, "js_execution_result", None)
+            if isinstance(js_result, dict) and js_result.get("success") is not False:
+                data = js_result
+                if "results" in js_result and isinstance(js_result["results"], list) and js_result["results"]:
+                    data = js_result["results"][0]
+                elif "result" in js_result:
+                    data = js_result["result"]
+                if isinstance(data, dict):
+                    bd = data.get("breakdown")
+                    if isinstance(bd, dict) and bd:
+                        resource_breakdown = {k: int(v) for k, v in bd.items() if isinstance(v, (int, float))}
+                    rt = data.get("responseTimeMs")
+                    if isinstance(rt, (int, float)) and rt > 0 and resp_time is None:
+                        resp_time = round(float(rt), 1)
+
             # Run per-page audit
-            page_audit = self.analyze_page(result, response_time_ms=times.get(result.url))
+            page_audit = self.analyze_page(result, response_time_ms=resp_time, resource_breakdown=resource_breakdown)
             page_results[result.url] = page_audit
 
-            # Build internal link graph from crawl4ai's extracted links
-            internal_links = self._extract_internal_links(result)
-            link_graph[result.url] = internal_links
+            # Build internal link graph from crawl4ai's extracted links (only if not pre-built)
+            if internal_link_graph is None:
+                internal_links = self._extract_internal_links(result)
+                link_graph[result.url] = internal_links
 
         return run_site_checks(
             page_results,
@@ -100,6 +131,8 @@ class SEOAnalyzer:
             domain_checks=domain_checks,
             broken_internal_urls=broken_internal_urls,
             crawl_metadata=crawl_metadata,
+            broken_external_urls=broken_external_urls,
+            redirect_chains=redirect_chains,
         )
 
     def analyze_html(
