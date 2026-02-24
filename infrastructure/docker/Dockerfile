@@ -22,10 +22,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium --with-deps
 
 # Point Lighthouse at Playwright's Chromium — resolve glob at build time and create a stable symlink
-RUN CHROME_REAL=$(ls /root/.cache/ms-playwright/chromium-*/chrome-linux/chrome 2>/dev/null | head -1) \
+# Playwright >=1.40 uses chrome-linux64/, older uses chrome-linux/
+RUN CHROME_REAL=$(ls /root/.cache/ms-playwright/chromium-*/chrome-linux/chrome /root/.cache/ms-playwright/chromium-*/chrome-linux64/chrome 2>/dev/null | head -1) \
     && if [ -n "${CHROME_REAL}" ]; then \
          ln -sf "${CHROME_REAL}" /usr/local/bin/chromium-browser; \
          echo "CHROME_PATH=/usr/local/bin/chromium-browser" >> /etc/environment; \
+         echo "Found Chromium at: ${CHROME_REAL}"; \
+       else \
+         echo "WARNING: Could not find Playwright Chromium binary!"; \
        fi
 
 ENV CHROME_PATH=/usr/local/bin/chromium-browser

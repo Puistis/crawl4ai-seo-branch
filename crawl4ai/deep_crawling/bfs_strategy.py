@@ -177,6 +177,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         else:
             # Original initialization
             visited: Set[str] = set()
+            visited.add(start_url)  # Prevent re-crawling start URL from child pages
             # current_level holds tuples: (url, parent_url)
             current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
             depths: Dict[str, int] = {start_url: 0}
@@ -295,6 +296,7 @@ class BFSDeepCrawlStrategy(DeepCrawlStrategy):
         else:
             # Original initialization
             visited: Set[str] = set()
+            visited.add(start_url)  # Prevent re-crawling start URL from child pages
             current_level: List[Tuple[str, Optional[str]]] = [(start_url, None)]
             depths: Dict[str, int] = {start_url: 0}
 

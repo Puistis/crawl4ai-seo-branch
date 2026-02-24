@@ -64,30 +64,122 @@ async def check_robots_txt(
     blocked_paths: List[str] = []
     has_sitemap_ref = False
     blocks_important = False
+    findings: List[str] = []
+    sitemap_refs: List[str] = []
+    conflicting_rules: List[str] = []
+    crawl_delay_directives: List[str] = []
+
+    # Parse into per-user-agent sections
+    current_agent = "*"
+    agent_rules: dict = {}  # agent -> list of (directive, path)
 
     for line in content.splitlines():
         line = line.strip()
         lower = line.lower()
 
-        if lower.startswith("sitemap:"):
-            has_sitemap_ref = True
+        # Skip comments and empty lines
+        if not line or line.startswith("#"):
+            continue
 
-        if lower.startswith("disallow:"):
+        if lower.startswith("user-agent:"):
+            current_agent = line.split(":", 1)[1].strip()
+            if current_agent not in agent_rules:
+                agent_rules[current_agent] = []
+
+        elif lower.startswith("sitemap:"):
+            has_sitemap_ref = True
+            # Extract full URL after "Sitemap:" prefix (case-insensitive)
+            sitemap_url = line[len("sitemap:"):].strip()
+            if sitemap_url:
+                sitemap_refs.append(sitemap_url)
+
+        elif lower.startswith("crawl-delay:"):
+            delay_val = line.split(":", 1)[1].strip()
+            directive = f"Crawl-delay: {delay_val} for {current_agent}"
+            crawl_delay_directives.append(directive)
+            findings.append(f"{directive} (may slow crawling)")
+
+        elif lower.startswith("disallow:"):
             path = line.split(":", 1)[1].strip()
             if path:
                 blocked_paths.append(path)
-                # Check if any important path is blocked
+                if current_agent not in agent_rules:
+                    agent_rules[current_agent] = []
+                agent_rules[current_agent].append(("disallow", path))
                 for important in IMPORTANT_PATHS:
                     if important.startswith(path) or path == "/":
                         blocks_important = True
+
+        elif lower.startswith("allow:"):
+            path = line.split(":", 1)[1].strip()
+            if path:
+                if current_agent not in agent_rules:
+                    agent_rules[current_agent] = []
+                agent_rules[current_agent].append(("allow", path))
+
+    # Detect conflicting Allow/Disallow for the same agent
+    # Note: Allow / + Disallow /specific is standard (not a conflict)
+    for agent, rules in agent_rules.items():
+        allows = [p for d, p in rules if d == "allow"]
+        disallows = [p for d, p in rules if d == "disallow"]
+        for allow_path in allows:
+            for disallow_path in disallows:
+                # Skip trivial non-conflicts: Allow / + Disallow /anything is standard
+                if allow_path == "/":
+                    continue
+                # Skip: Disallow / + Allow /specific is also standard (override)
+                if disallow_path == "/":
+                    continue
+                # Real conflict: overlapping specific paths
+                if allow_path.startswith(disallow_path) or disallow_path.startswith(allow_path):
+                    conflict = f"{agent}: Allow {allow_path} vs Disallow {disallow_path}"
+                    conflicting_rules.append(conflict)
+                    findings.append(f"Conflicting directives for {conflict}")
+
+    # BUG-6: Validate sitemap references — check reachability AND valid XML content
+    broken_sitemap_refs: List[str] = []
+    if sitemap_refs:
+        try:
+            async with aiohttp.ClientSession() as sess:
+                for smap_url in sitemap_refs[:5]:
+                    try:
+                        async with sess.get(smap_url, timeout=aiohttp.ClientTimeout(total=10), allow_redirects=True) as resp:
+                            if resp.status >= 400:
+                                broken_sitemap_refs.append(smap_url)
+                                findings.append(f"Broken sitemap reference: {smap_url} (HTTP {resp.status})")
+                            else:
+                                # Verify content is valid XML with sitemap elements
+                                body = await resp.read()
+                                try:
+                                    root = ElementTree.fromstring(body)
+                                    tag = root.tag.lower()
+                                    if "urlset" not in tag and "sitemapindex" not in tag:
+                                        broken_sitemap_refs.append(smap_url)
+                                        findings.append(f"Sitemap reference {smap_url} is not valid sitemap XML (root: {root.tag})")
+                                except ElementTree.ParseError:
+                                    broken_sitemap_refs.append(smap_url)
+                                    findings.append(f"Sitemap reference {smap_url} returns invalid XML")
+                    except Exception:
+                        broken_sitemap_refs.append(smap_url)
+                        findings.append(f"Broken sitemap reference: {smap_url} (unreachable)")
+        except Exception:
+            pass
 
     issues = []
     if blocks_important:
         issues.append("blocks important pages")
     if not has_sitemap_ref:
         issues.append("no sitemap reference")
+    if crawl_delay_directives:
+        issues.append("has crawl-delay directive")
+    if broken_sitemap_refs:
+        issues.append(f"{len(broken_sitemap_refs)} broken sitemap ref(s)")
+    if conflicting_rules:
+        issues.append(f"{len(conflicting_rules)} conflicting rule(s)")
 
     if blocks_important:
+        status = CheckStatus.WARNING
+    elif broken_sitemap_refs or conflicting_rules:
         status = CheckStatus.WARNING
     elif not has_sitemap_ref:
         status = CheckStatus.INFO
@@ -102,9 +194,14 @@ async def check_robots_txt(
     return RobotsTxtCheck(
         exists=True,
         has_sitemap_reference=has_sitemap_ref,
+        sitemap_refs=sitemap_refs[:10],
+        broken_sitemap_refs=broken_sitemap_refs,
         blocked_paths=blocked_paths[:20],
         blocks_important_pages=blocks_important,
+        conflicting_rules=conflicting_rules[:10],
+        crawl_delay_directives=crawl_delay_directives[:10],
         raw_content=content[:5000],
+        findings=findings[:20],
         status=status,
         note=note,
     )
@@ -224,11 +321,17 @@ async def check_sitemap(
                 if loc is not None and loc.text:
                     sitemap_urls.append(loc.text.strip())
     except ElementTree.ParseError:
+        # BUG-7: Even with invalid XML, try to extract URLs via regex for cross-referencing
+        import re as _re
+        raw_text = content_bytes.decode("utf-8", errors="replace")
+        fallback_urls = _re.findall(r'<loc>\s*(https?://[^<\s]+)\s*</loc>', raw_text)
         return SitemapCheck(
             exists=True,
             is_valid_xml=False,
+            urls_in_sitemap=fallback_urls[:200],
+            url_count=len(fallback_urls),
             status=CheckStatus.WARNING,
-            note="sitemap.xml exists but contains invalid XML",
+            note=f"sitemap.xml exists but contains invalid XML ({len(fallback_urls)} URLs extracted via fallback)",
         )
 
     url_count = len(sitemap_urls)

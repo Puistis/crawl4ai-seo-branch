@@ -63,6 +63,7 @@ class HeadingInfo(BaseModel):
 class HeadingCheck(BaseModel):
     h1_count: int = 0
     h1_values: List[str] = Field(default_factory=list)
+    has_empty_h1: bool = False
     hierarchy_valid: bool = True
     skipped_levels: List[str] = Field(default_factory=list)
     all_headings: List[HeadingInfo] = Field(default_factory=list)
@@ -89,10 +90,13 @@ class ImageCheck(BaseModel):
     total: int = 0
     missing_alt: int = 0
     empty_alt: int = 0
+    long_alt: int = 0
+    keyword_stuffed_alt: int = 0
     missing_dimensions: int = 0
     non_modern_format: int = 0
     potentially_oversized: int = 0
     missing_lazy_loading: int = 0
+    broken_src: int = 0
     images: List[ImageInfo] = Field(default_factory=list)
     status: CheckStatus = CheckStatus.PASS
     note: str = ""
@@ -110,6 +114,11 @@ class LinkStats(BaseModel):
     external_count: int = 0
     nofollow_count: int = 0
     unique_internal_targets: int = 0
+    javascript_href_count: int = 0
+    empty_href_count: int = 0
+    sponsored_count: int = 0
+    ugc_count: int = 0
+    internal_nofollow_count: int = 0
     internal_urls: List[str] = Field(default_factory=list)
     external_urls: List[str] = Field(default_factory=list)
     link_details: List[LinkDetail] = Field(default_factory=list)
@@ -163,6 +172,7 @@ class HreflangEntry(BaseModel):
 class HreflangCheck(BaseModel):
     entries: List[HreflangEntry] = Field(default_factory=list)
     has_x_default: bool = False
+    validation_errors: List[str] = Field(default_factory=list)
     status: CheckStatus = CheckStatus.INFO
     note: str = ""
 
@@ -248,6 +258,21 @@ class PageAuditResult(BaseModel):
     lang: LangCheck = Field(default_factory=LangCheck)
     charset: CharsetCheck = Field(default_factory=CharsetCheck)
     performance: PerformanceCheck = Field(default_factory=PerformanceCheck)
+    meta_refresh_url: Optional[str] = None
+    hidden_text: List[str] = Field(default_factory=list)
+    keyword_stuffing: Optional[str] = None
+    has_placeholder_content: bool = False
+    content_hash: Optional[str] = None
+    content_shingles: Optional[Any] = None
+    is_soft_404: bool = False
+    iframe_count: int = 0
+    iframes_missing_title: int = 0
+    iframes_empty_src: int = 0
+    has_placeholder_meta_desc: bool = False
+    rel_next: Optional[str] = None
+    rel_prev: Optional[str] = None
+    inline_css_count: int = 0
+    inline_style_bytes: int = 0
 
     @property
     def critical_issues(self) -> List[str]:
@@ -276,9 +301,14 @@ class PageAuditResult(BaseModel):
 class RobotsTxtCheck(BaseModel):
     exists: bool = False
     has_sitemap_reference: bool = False
+    sitemap_refs: List[str] = Field(default_factory=list)
+    broken_sitemap_refs: List[str] = Field(default_factory=list)
     blocked_paths: List[str] = Field(default_factory=list)
     blocks_important_pages: bool = False
+    conflicting_rules: List[str] = Field(default_factory=list)
+    crawl_delay_directives: List[str] = Field(default_factory=list)
     raw_content: Optional[str] = None
+    findings: List[str] = Field(default_factory=list)
     status: CheckStatus = CheckStatus.INFO
     note: str = ""
 

@@ -28,6 +28,7 @@ sys.path.insert(0, "/app")
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.deep_crawling import BFSDeepCrawlStrategy
 from crawl4ai.seo_audit import SEOAnalyzer
+from crawl4ai.seo_audit.site_checks import run_site_checks
 from crawl4ai.seo_audit.domain_checks import run_domain_checks
 
 logging.basicConfig(
@@ -76,7 +77,21 @@ if (nav.length > 0) {
     breakdown['document'] = nav[0].transferSize || nav[0].encodedBodySize || 0;
     responseTimeMs = nav[0].responseEnd - nav[0].requestStart;
 }
-return { breakdown: breakdown, imageSizes: imageSizes, responseTimeMs: responseTimeMs };
+// BUG-4: Collect image srcs that lack explicit width/height HTML attributes
+const imgsMissingDims = [];
+// BUG-17: Collect broken image srcs (failed to load)
+const imgsBrokenSrc = [];
+document.querySelectorAll('img').forEach(img => {
+    if (!img.hasAttribute('width') || !img.hasAttribute('height')) {
+        imgsMissingDims.push(img.src || img.dataset.src || '');
+    }
+    // naturalWidth/Height is 0 for images that failed to load (and not SVGs)
+    const src = img.src || '';
+    if (src && src !== window.location.href && img.complete && img.naturalWidth === 0) {
+        imgsBrokenSrc.push(src);
+    }
+});
+return { breakdown: breakdown, imageSizes: imageSizes, responseTimeMs: responseTimeMs, imgsMissingDims: imgsMissingDims, imgsBrokenSrc: imgsBrokenSrc };
 """
 
 state = {
@@ -92,6 +107,11 @@ state = {
     "redirect_chains": [],      # redirect chain entries from crawl
 }
 state_lock = threading.Lock()
+
+# Store PageAuditResult objects during incremental auditing.
+# Used by _post_crawl_analysis for site-level checks (avoids re-auditing
+# and works even when the crawl times out before returning CrawlResult objects).
+_page_audit_results = {}  # Dict[str, PageAuditResult]
 
 
 def _persist_state():
@@ -197,14 +217,14 @@ _analyzer = SEOAnalyzer()
 
 
 def _extract_resource_timing(crawl_result):
-    """Extract resource breakdown, per-image sizes, and response time from JS execution result.
-    Returns (resource_breakdown, image_sizes, response_time_ms) — all may be None."""
+    """Extract resource breakdown, per-image sizes, response time, images missing dims, and broken images from JS execution result.
+    Returns (resource_breakdown, image_sizes, response_time_ms, imgs_missing_dims, imgs_broken_src) — all may be None."""
     js_result = getattr(crawl_result, "js_execution_result", None)
     logger.info(f"JS execution result keys for {crawl_result.url}: {list(js_result.keys()) if isinstance(js_result, dict) else type(js_result)}")
     if not isinstance(js_result, dict) or js_result.get("success") is False:
-        return None, None, None
+        return None, None, None, None, None
 
-    # The JS returns { breakdown: {...}, imageSizes: {...}, responseTimeMs: number }
+    # The JS returns { breakdown: {...}, imageSizes: {...}, responseTimeMs: number, imgsMissingDims: [...] }
     # crawl4ai wraps it as: { success: true, results: [ <actual_result> ] }
     data = js_result
     if "results" in js_result and isinstance(js_result["results"], list) and js_result["results"]:
@@ -212,11 +232,13 @@ def _extract_resource_timing(crawl_result):
     elif "result" in js_result:
         data = js_result["result"]
     if not isinstance(data, dict):
-        return None, None, None
+        return None, None, None, None, None
 
     breakdown_raw = data.get("breakdown")
     image_sizes_raw = data.get("imageSizes")
     response_time_raw = data.get("responseTimeMs")
+    imgs_missing_dims_raw = data.get("imgsMissingDims")
+    imgs_broken_src_raw = data.get("imgsBrokenSrc")
 
     resource_breakdown = None
     if isinstance(breakdown_raw, dict) and breakdown_raw:
@@ -233,7 +255,17 @@ def _extract_resource_timing(crawl_result):
     if isinstance(response_time_raw, (int, float)) and response_time_raw > 0:
         response_time_ms = round(float(response_time_raw), 1)
 
-    return resource_breakdown, image_sizes, response_time_ms
+    # BUG-4: List of image srcs that lack explicit width/height in the DOM
+    imgs_missing_dims = None
+    if isinstance(imgs_missing_dims_raw, list):
+        imgs_missing_dims = set(imgs_missing_dims_raw)
+
+    # BUG-17: List of image srcs that failed to load (naturalWidth === 0)
+    imgs_broken_src = None
+    if isinstance(imgs_broken_src_raw, list):
+        imgs_broken_src = set(imgs_broken_src_raw)
+
+    return resource_breakdown, image_sizes, response_time_ms, imgs_missing_dims, imgs_broken_src
 
 
 async def _on_crawl_progress(crawl_state: dict):
@@ -255,7 +287,7 @@ async def _on_crawl_progress(crawl_state: dict):
             logger.info(f"Auditing page: {final_url} (html={len(last_result.html or '')} bytes, redirected={was_redirected})")
 
             # Extract resource breakdown + response time from JS execution result (Performance API)
-            resource_breakdown, image_sizes, resp_time = _extract_resource_timing(last_result)
+            resource_breakdown, image_sizes, resp_time, imgs_missing_dims, imgs_broken_src = _extract_resource_timing(last_result)
 
             # Override url and status_code on the result so analyze_page uses the final values
             orig_url, orig_status = last_result.url, last_result.status_code
@@ -269,7 +301,35 @@ async def _on_crawl_progress(crawl_state: dict):
                 for img in page_audit.images.images:
                     if img.src in image_sizes:
                         img.file_size_bytes = image_sizes[img.src]
+
+            # BUG-4: Override missing_dimensions using live DOM check (JS hasAttribute)
+            # Playwright's rendered HTML may inject intrinsic width/height attributes,
+            # so we use the JS-collected list of images truly missing explicit attrs.
+            if imgs_missing_dims is not None and page_audit.images.images:
+                fixed_missing = 0
+                for img in page_audit.images.images:
+                    src = img.src
+                    if src in imgs_missing_dims:
+                        if not img.missing_dimensions:
+                            img.missing_dimensions = True
+                            fixed_missing += 1
+                    else:
+                        if img.missing_dimensions:
+                            img.missing_dimensions = False
+                if fixed_missing > 0 or page_audit.images.missing_dimensions > 0:
+                    page_audit.images.missing_dimensions = sum(1 for i in page_audit.images.images if i.missing_dimensions)
+                    logger.info(f"BUG-4 fix: {page_audit.images.missing_dimensions} images truly missing dimensions on {final_url}")
+
+            # BUG-17: Override broken_src count using JS-detected broken images
+            if imgs_broken_src and page_audit.images.images:
+                js_broken = len(imgs_broken_src)
+                if js_broken > page_audit.images.broken_src:
+                    page_audit.images.broken_src = js_broken
+                    logger.info(f"BUG-17 fix: {js_broken} broken image src(s) detected via JS on {final_url}")
+
             logger.info(f"Page audit complete: {final_url}")
+            # Store PageAuditResult for site-level checks (works even if crawl times out)
+            _page_audit_results[final_url] = page_audit
             payload = _audit_page_to_payload(page_audit)
             logger.info(f"Payload built: {final_url}")
             snapshot = {"url": final_url, "html": last_result.html[:500_000]} if last_result.html else None
@@ -283,16 +343,35 @@ async def _on_crawl_progress(crawl_state: dict):
                     "anchor_text": ld.anchor_text[:200] if ld.anchor_text else "",
                     "is_nofollow": ld.is_nofollow,
                     "link_type": ld.link_type,
+                    "rel": getattr(ld, "rel", None) or "",
                 })
 
             # Track redirect chains from crawl result metadata
             redirect_entry = None
             if was_redirected and _normalize_url(orig_url) != final_url:
+                # Use full redirect chain from Playwright if available
+                chain = getattr(last_result, "redirect_chain", None) or [orig_url, final_url]
                 redirect_entry = {
                     "source_url": orig_url,
                     "final_url": final_url,
+                    "chain_length": len(chain) - 1,
+                    "chain_path": chain,
+                }
+
+            # BUG-3: Track meta-refresh redirects as redirect chain entries
+            meta_refresh_entry = None
+            if page_audit.meta_refresh_url:
+                meta_target = page_audit.meta_refresh_url
+                # Resolve relative URLs
+                if not meta_target.startswith("http"):
+                    from urllib.parse import urljoin
+                    meta_target = urljoin(final_url, meta_target)
+                meta_refresh_entry = {
+                    "source_url": final_url,
+                    "final_url": meta_target,
                     "chain_length": 1,
-                    "chain_path": [orig_url, final_url],
+                    "chain_path": [final_url, meta_target],
+                    "is_meta_refresh": True,
                 }
 
             # Dedup: skip if we already audited this final URL
@@ -307,6 +386,8 @@ async def _on_crawl_progress(crawl_state: dict):
                     state["partial_link_graph"].extend(link_graph_entries)
                 if redirect_entry:
                     state["redirect_chains"].append(redirect_entry)
+                if meta_refresh_entry:
+                    state["redirect_chains"].append(meta_refresh_entry)
                 state["pages_done"] = len(state["partial_pages"])
                 state["pages_found"] = max(urls_count, pages_crawled)
                 _persist_state()
@@ -330,7 +411,8 @@ BOT_BLOCKED_DOMAINS = frozenset({
 
 
 async def _check_external_links(page_payloads):
-    """HEAD-check unique external URLs found during crawl. Returns dict of broken URL -> status code."""
+    """HEAD-check unique external URLs found during crawl. Returns dict of broken URL -> status code.
+    BUG-02/07: Uses concurrent checks with semaphore and better error classification."""
     # Collect unique external URLs from all page audits
     external_urls = set()
     for p in page_payloads:
@@ -358,19 +440,93 @@ async def _check_external_links(page_payloads):
 
     broken: dict = {}
     timeout = aiohttp.ClientTimeout(total=EXTERNAL_CHECK_TIMEOUT_S)
+    sem = asyncio.Semaphore(10)  # BUG-07: concurrent checks to avoid overall timeout
+
+    async def _check_one(session, url):
+        """Check a single external URL with HEAD then GET fallback."""
+        async with sem:
+            try:
+                async with session.head(url, allow_redirects=True) as resp:
+                    if resp.status >= 400:
+                        return url, resp.status
+                    return url, None
+            except asyncio.TimeoutError:
+                return url, -1  # timeout
+            except aiohttp.ClientConnectorCertificateError:
+                return url, -3  # SSL error
+            except aiohttp.ClientConnectorDNSError:
+                # BUG-02: Distinguish DNS errors from other connection errors
+                return url, -4  # DNS resolution failure
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError):
+                # HEAD may fail due to proxy/WAF blocking; retry with GET
+                try:
+                    async with session.get(url, allow_redirects=True) as resp2:
+                        if resp2.status >= 400:
+                            return url, resp2.status
+                        return url, None
+                except asyncio.TimeoutError:
+                    return url, -1
+                except aiohttp.ClientConnectorCertificateError:
+                    return url, -3
+                except aiohttp.ClientConnectorDNSError:
+                    return url, -4
+                except Exception:
+                    return url, -2  # connection error
+            except Exception:
+                return url, -2  # other network error
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for url in urls_to_check:
+        tasks = [_check_one(session, url) for url in urls_to_check]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            url, status = result
+            if status is not None:
+                broken[url] = status
+
+    logger.info(f"External link check done: {len(broken)} broken out of {len(urls_to_check)}")
+    return broken
+
+
+async def _check_uncrawled_internal_links(link_graph_data, crawled_urls_norm, domain):
+    """HEAD-check internal link targets that weren't visited by BFS.
+    Returns dict of broken URL -> status code."""
+    # Collect unique internal link targets not in crawled set
+    uncrawled_targets = set()
+    for entry in link_graph_data:
+        if entry.get("link_type") != "internal":
+            continue
+        target = entry["target_url"]
+        norm = _normalize_url(target)
+        if norm not in crawled_urls_norm:
+            parsed = urlparse(target)
+            if parsed.netloc.lower() == domain.lower():
+                uncrawled_targets.add(target)
+
+    if not uncrawled_targets:
+        return {}
+
+    # Limit to 50 checks to avoid excessive requests
+    targets_to_check = list(uncrawled_targets)[:50]
+    logger.info(f"HEAD-checking {len(targets_to_check)} uncrawled internal link targets (of {len(uncrawled_targets)} total)")
+
+    broken: dict = {}
+    timeout = aiohttp.ClientTimeout(total=5)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for url in targets_to_check:
             try:
                 async with session.head(url, allow_redirects=True) as resp:
                     if resp.status >= 400:
                         broken[url] = resp.status
             except asyncio.TimeoutError:
-                broken[url] = 0  # timeout
+                pass  # Don't count timeouts as broken for internal links
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError):
+                broken[url] = -2
             except Exception:
-                broken[url] = 0  # connection error
+                pass
 
-    logger.info(f"External link check done: {len(broken)} broken out of {len(urls_to_check)}")
+    logger.info(f"Uncrawled internal link check: {len(broken)} broken out of {len(targets_to_check)}")
     return broken
 
 
@@ -388,6 +544,12 @@ async def _post_crawl_analysis(domain, scheme, crawl_results, crawl_start):
         cr.url for cr in crawl_results
         if not cr.success or (cr.status_code and cr.status_code >= 400)
     } if crawl_results else set()
+
+    # BUG-01: Also include soft-404 pages (HTTP 200 but "not found" content)
+    for url, par in _page_audit_results.items():
+        if par.is_soft_404:
+            broken_internal_urls.add(url)
+            logger.debug(f"BUG-01: Soft-404 page added to broken internals: {url}")
 
     domain_check_result = None
     try:
@@ -416,26 +578,177 @@ async def _post_crawl_analysis(domain, scheme, crawl_results, crawl_start):
     except Exception as e:
         logger.warning(f"External link checks failed (non-fatal): {e}")
 
+    # ── BUG-2/3: Follow meta-refresh chains to detect loops and multi-hop chains ──
+    # Collect meta-refresh targets from audited pages
+    meta_refresh_graph = {}
+    for url, par in _page_audit_results.items():
+        if par.meta_refresh_url:
+            target = par.meta_refresh_url
+            if not target.startswith("http"):
+                from urllib.parse import urljoin
+                target = urljoin(url, target)
+            meta_refresh_graph[url] = target
+
+    # HEAD-fetch uncrawled meta-refresh targets to detect their own meta-refresh
+    if meta_refresh_graph:
+        crawled_norm = {_normalize_url(u) for u in _page_audit_results.keys()}
+        uncrawled_meta_targets = set()
+        for target in meta_refresh_graph.values():
+            if _normalize_url(target) not in crawled_norm:
+                uncrawled_meta_targets.add(target)
+
+        if uncrawled_meta_targets:
+            logger.info(f"BUG-2: Fetching {len(uncrawled_meta_targets)} uncrawled meta-refresh targets for loop detection")
+            try:
+                timeout_meta = aiohttp.ClientTimeout(total=5)
+                async with aiohttp.ClientSession(timeout=timeout_meta) as sess:
+                    for target_url in list(uncrawled_meta_targets)[:20]:
+                        try:
+                            async with sess.get(target_url, allow_redirects=True) as resp:
+                                if resp.status == 200:
+                                    body = await resp.text()
+                                    # Check for meta refresh in the response
+                                    import re as _re
+                                    meta_match = _re.search(
+                                        r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']?\d+;\s*url=([^"\'>\s]+)',
+                                        body, _re.IGNORECASE
+                                    )
+                                    if meta_match:
+                                        next_url = meta_match.group(1)
+                                        if not next_url.startswith("http"):
+                                            next_url = urljoin(target_url, next_url)
+                                        meta_refresh_graph[target_url] = next_url
+                                        logger.info(f"BUG-2: Found meta-refresh on uncrawled {target_url} -> {next_url}")
+                        except Exception as e:
+                            logger.debug(f"BUG-2: Failed to fetch {target_url}: {e}")
+            except Exception as e:
+                logger.warning(f"BUG-2: Meta-refresh chain following failed: {e}")
+
+        # BUG-2/3: Build chains and detect loops from the meta-refresh graph
+        # Also build normalized lookup for flexible matching
+        norm_to_url = {}
+        for u in meta_refresh_graph:
+            norm_to_url[_normalize_url(u)] = u
+
+        def _resolve_next(cur):
+            nxt = meta_refresh_graph.get(cur)
+            if not nxt:
+                norm_cur = _normalize_url(cur)
+                real = norm_to_url.get(norm_cur)
+                if real:
+                    nxt = meta_refresh_graph.get(real)
+            return nxt
+
+        recorded_chains = set()
+        for start_url in meta_refresh_graph:
+            visited = set()
+            current = start_url
+            chain_path = [current]
+            is_loop = False
+            for _ in range(10):
+                if current in visited:
+                    is_loop = True
+                    break
+                visited.add(current)
+                next_url = _resolve_next(current)
+                if not next_url:
+                    break
+                chain_path.append(next_url)
+                current = next_url
+
+            # Record chains with 2+ hops (or loops)
+            if len(chain_path) >= 3 or is_loop:
+                chain_key = tuple(chain_path)
+                if chain_key not in recorded_chains:
+                    recorded_chains.add(chain_key)
+                    entry = {
+                        "source_url": start_url,
+                        "final_url": chain_path[-1],
+                        "chain_length": len(chain_path) - 1,
+                        "chain_path": chain_path,
+                        "is_meta_refresh": True,
+                        "is_loop": is_loop,
+                    }
+                    with state_lock:
+                        state["redirect_chains"].append(entry)
+                    redirect_chains_data.append(entry)
+                    label = "loop" if is_loop else "chain"
+                    logger.info(f"BUG-2/3: Detected meta-refresh {label}: {' -> '.join(chain_path)}")
+
+    # ── HEAD-check uncrawled internal link targets ─────────────────────
+    # BFS may not visit all link targets (max_pages limit), so HEAD-check them
+    crawled_urls_norm = {_normalize_url(cr.url) for cr in crawl_results} if crawl_results else set()
+    uncrawled_broken = {}
+    try:
+        logger.info("Starting uncrawled internal link checks...")
+        uncrawled_broken = await asyncio.wait_for(
+            _check_uncrawled_internal_links(link_graph_data, crawled_urls_norm, domain),
+            timeout=15,
+        )
+        # Merge into broken_internal_urls
+        for url, sc in uncrawled_broken.items():
+            broken_internal_urls.add(url)
+        logger.info(f"Uncrawled internal check done: {len(uncrawled_broken)} broken")
+    except asyncio.TimeoutError:
+        logger.warning("Uncrawled internal link checks timed out after 15s (non-fatal)")
+    except Exception as e:
+        logger.warning(f"Uncrawled internal link checks failed (non-fatal): {e}")
+
     # ── Build broken_links payload (internal + external) ─────────────
     broken_links_payload = []
-    # Internal broken links: cross-reference link_graph with broken_internal_urls
+    # Build normalized lookup sets for robust URL matching
+    status_code_map = {}
+    normalized_broken = set()
+    for cr in (crawl_results or []):
+        norm = _normalize_url(cr.url)
+        if cr.status_code:
+            status_code_map[norm] = cr.status_code
+            status_code_map[cr.url] = cr.status_code
+        if not cr.success or (cr.status_code and cr.status_code >= 400):
+            normalized_broken.add(norm)
+    # Merge broken_internal_urls (includes both crawled 404s and HEAD-checked 404s)
+    for u in (broken_internal_urls or set()):
+        normalized_broken.add(_normalize_url(u))
+    # Merge uncrawled broken with status codes
+    for url, sc in uncrawled_broken.items():
+        norm = _normalize_url(url)
+        status_code_map[norm] = sc
+        status_code_map[url] = sc
+
+    def _status_desc(sc):
+        """Convert status code to descriptive string (BUG-02/07)."""
+        if sc is None:
+            return "unknown"
+        if sc == -1:
+            return "TIMEOUT"
+        if sc == -2:
+            return "CONNECTION_ERROR"
+        if sc == -3:
+            return "SSL_ERROR"
+        if sc == -4:
+            return "DNS_ERROR"
+        if sc == 0:
+            return "TIMEOUT"
+        if sc >= 400:
+            return f"HTTP_{sc}"
+        return str(sc)
+
+    # Internal broken links: cross-reference link_graph with broken URLs
     for entry in link_graph_data:
-        if entry["link_type"] == "internal" and entry["target_url"] in broken_internal_urls:
+        if entry["link_type"] != "internal":
+            continue
+        target = entry["target_url"]
+        norm_target = _normalize_url(target)
+        if norm_target in normalized_broken or target in (broken_internal_urls or set()):
+            sc = status_code_map.get(norm_target) or status_code_map.get(target)
             broken_links_payload.append({
                 "source_url": entry["source_url"],
-                "target_url": entry["target_url"],
-                "status_code": None,  # we know it's broken but don't have exact code from link graph
+                "target_url": target,
+                "status_code": sc,
+                "status_code_desc": _status_desc(sc),
                 "anchor_text": entry.get("anchor_text", ""),
                 "link_type": "internal",
             })
-    # Look up actual status codes from crawl results for internal broken links
-    status_code_map = {}
-    for cr in (crawl_results or []):
-        if cr.status_code:
-            status_code_map[cr.url] = cr.status_code
-    for bl in broken_links_payload:
-        if bl["link_type"] == "internal" and bl["target_url"] in status_code_map:
-            bl["status_code"] = status_code_map[bl["target_url"]]
 
     # External broken links
     for ext_url, ext_status in broken_external_urls.items():
@@ -446,6 +759,7 @@ async def _post_crawl_analysis(domain, scheme, crawl_results, crawl_start):
                     "source_url": entry["source_url"],
                     "target_url": ext_url,
                     "status_code": ext_status,
+                    "status_code_desc": _status_desc(ext_status),
                     "anchor_text": entry.get("anchor_text", ""),
                     "link_type": "external",
                 })
@@ -473,16 +787,18 @@ async def _post_crawl_analysis(domain, scheme, crawl_results, crawl_start):
     logger.info(f"Built link graph: {len(built_link_graph)} source pages, {sum(len(v) for v in built_link_graph.values())} edges")
 
     try:
-        logger.info(f"Starting site-level analysis on {len(crawl_results or [])} crawl results...")
-        site_result = _analyzer.analyze_site(
-            crawl_results or [],
-            response_times=response_times,
+        # Use PageAuditResult objects stored during incremental auditing.
+        # This is critical: when the crawl times out, crawl_results is empty
+        # but _page_audit_results has all the audited pages.
+        logger.info(f"Starting site-level analysis on {len(_page_audit_results)} audited pages (crawl_results had {len(crawl_results or [])} items)...")
+        site_result = run_site_checks(
+            _page_audit_results,
+            internal_link_graph=built_link_graph,
             domain_checks=domain_check_result,
             broken_internal_urls=broken_internal_urls,
             crawl_metadata=crawl_metadata,
             broken_external_urls=broken_external_urls,
             redirect_chains=redirect_chains_data,
-            internal_link_graph=built_link_graph,
         )
         logger.info(f"Site analysis done. Score: {site_result.summary.score}/100")
     except Exception as e:
@@ -664,11 +980,15 @@ def _resolve_chrome_path() -> str | None:
     if os.path.isfile("/usr/local/bin/chromium-browser"):
         os.environ["CHROME_PATH"] = "/usr/local/bin/chromium-browser"
         return "/usr/local/bin/chromium-browser"
-    # Glob for Playwright's Chromium
-    candidates = _glob.glob("/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome")
-    if candidates:
-        os.environ["CHROME_PATH"] = candidates[0]
-        return candidates[0]
+    # Glob for Playwright's Chromium (chrome-linux for older, chrome-linux64 for >=1.40)
+    for pattern in [
+        "/root/.cache/ms-playwright/chromium-*/chrome-linux/chrome",
+        "/root/.cache/ms-playwright/chromium-*/chrome-linux64/chrome",
+    ]:
+        candidates = _glob.glob(pattern)
+        if candidates:
+            os.environ["CHROME_PATH"] = candidates[0]
+            return candidates[0]
     return None
 
 
@@ -879,6 +1199,7 @@ class Handler(BaseHTTPRequestHandler):
                 state["partial_snapshots"] = []
                 state["partial_link_graph"] = []
                 state["redirect_chains"] = []
+                _page_audit_results.clear()
 
             # Start crawl in background thread
             t = threading.Thread(
@@ -886,7 +1207,7 @@ class Handler(BaseHTTPRequestHandler):
                 args=(
                     body.get("job_id", ""),
                     body["url"],
-                    body.get("max_pages", 50),
+                    body.get("max_pages", 200),
                     body.get("max_depth", 3),
                 ),
                 daemon=True,

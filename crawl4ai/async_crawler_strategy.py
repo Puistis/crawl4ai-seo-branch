@@ -519,7 +519,8 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
         response_headers = {}
         execution_result = None
         status_code = None
-        redirected_url = url 
+        redirected_url = url
+        chain_urls = []
 
         # Reset downloaded files list for new crawl
         self._downloaded_files = []
@@ -729,12 +730,17 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     else:
                         first_resp = response
                         req = response.request
+                        chain_urls = []
                         while req and req.redirected_from:
                             prev_req = req.redirected_from
+                            chain_urls.append(prev_req.url)
                             prev_resp = await prev_req.response()
                             if prev_resp:                       # keep earliest
                                 first_resp = prev_resp
                             req = prev_req
+                        if chain_urls:
+                            chain_urls.reverse()  # first request → last
+                            chain_urls.append(page.url)  # append final URL
 
                         status_code = first_resp.status
                         response_headers = first_resp.headers
@@ -1060,6 +1066,7 @@ class AsyncPlaywrightCrawlerStrategy(AsyncCrawlerStrategy):
                     self._downloaded_files if self._downloaded_files else None
                 ),
                 redirected_url=redirected_url,
+                redirect_chain=chain_urls if chain_urls else None,
                 # Include captured data if enabled
                 network_requests=captured_requests if config.capture_network_requests else None,
                 console_messages=captured_console if config.capture_console_messages else None,

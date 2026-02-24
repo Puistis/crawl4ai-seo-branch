@@ -52,5 +52,5 @@ invocation_logs = true
 
 [vars]
 ENVIRONMENT = "production"
-MAX_PAGES_DEFAULT = "50"
-MAX_DEPTH_DEFAULT = "3"
+MAX_PAGES_DEFAULT = "200"
+MAX_DEPTH_DEFAULT = "6"

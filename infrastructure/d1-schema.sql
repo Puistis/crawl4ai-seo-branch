@@ -286,6 +286,15 @@ CREATE INDEX IF NOT EXISTS idx_lighthouse_job ON lighthouse_scores(job_id);
 CREATE INDEX IF NOT EXISTS idx_lighthouse_url ON lighthouse_scores(url);
 
 
+-- ─── Phase 4 Migration — Link Graph rel, Broken Links descriptions ─────────
+
+-- BUG-023: Store full rel attribute value (e.g., "nofollow sponsored")
+ALTER TABLE link_graph ADD COLUMN rel TEXT DEFAULT NULL;
+
+-- BUG-022: Store descriptive error name for non-HTTP status codes
+ALTER TABLE broken_links ADD COLUMN status_code_desc TEXT DEFAULT NULL;
+
+
 -- ─── Phase 3 Views ──────────────────────────────────────────────────────────
 
 -- Inbound link counts per page (most linked pages)

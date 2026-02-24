@@ -91,8 +91,8 @@ export class SEOAuditMcpAgent extends McpAgent {
 			"Start a new SEO audit crawl for a website. Returns a job_id to check status and retrieve results.",
 			{
 				url: z.string().describe("The starting URL to crawl (e.g. https://example.com)"),
-				max_pages: z.number().optional().describe("Maximum pages to crawl (default: 50)"),
-				max_depth: z.number().optional().describe("Maximum crawl depth from start URL (default: 3)"),
+				max_pages: z.number().optional().describe("Maximum pages to crawl (default: 200)"),
+				max_depth: z.number().optional().describe("Maximum crawl depth from start URL (default: 6)"),
 			},
 			async (args) => {
 				const result = await submitCrawl(workerEnv, args.url, args.max_pages, args.max_depth);
@@ -388,7 +388,7 @@ async function submitCrawl(
 
 	const domain = new URL(url).hostname;
 	const jobId = crypto.randomUUID();
-	const pages = maxPages ?? parseInt(env.MAX_PAGES_DEFAULT || "50");
+	const pages = maxPages ?? parseInt(env.MAX_PAGES_DEFAULT || "200");
 	const depth = maxDepth ?? parseInt(env.MAX_DEPTH_DEFAULT || "3");
 	const config = JSON.stringify({ max_pages: pages, max_depth: depth });
 
@@ -784,6 +784,9 @@ async function runLighthouseBulk(
 	if (!urls?.length) return { error: "urls array is required" };
 	if (urls.length > 20) return { error: "Maximum 20 URLs allowed" };
 
+	// BUG-10: Generate a job_id for lighthouse results tracking
+	const jobId = crypto.randomUUID();
+
 	// Use a dedicated container for lighthouse (keyed by timestamp to avoid conflicts)
 	const containerName = `lighthouse-${Date.now()}`;
 	const containerId = env.CRAWLER.idFromName(containerName);
@@ -798,6 +801,7 @@ async function runLighthouseBulk(
 					urls,
 					device: device || "mobile",
 					concurrency: Math.min(concurrency || 3, 5),
+					job_id: jobId,
 				}),
 			})
 		);
@@ -923,8 +927,8 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 	if (results.link_graph?.length) {
 		try {
 			const lgStmt = env.DB.prepare(
-				`INSERT INTO link_graph (id, job_id, source_url, target_url, anchor_text, is_nofollow, link_type)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+				`INSERT INTO link_graph (id, job_id, source_url, target_url, anchor_text, is_nofollow, link_type, rel)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 			);
 			const seen = new Set<string>();
 			const dedupedLg = results.link_graph.filter((lg: any) => {
@@ -945,7 +949,8 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 							lg.source_url, lg.target_url,
 							(lg.anchor_text ?? "").substring(0, 200),
 							lg.is_nofollow ? 1 : 0,
-							lg.link_type ?? "internal"
+							lg.link_type ?? "internal",
+							lg.rel ?? null
 						)
 					);
 					await env.DB.batch(batch);
@@ -979,8 +984,8 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 	if (results.broken_links?.length) {
 		try {
 			const blStmt = env.DB.prepare(
-				`INSERT INTO broken_links (id, job_id, source_url, target_url, status_code, anchor_text, link_type)
-				 VALUES (?, ?, ?, ?, ?, ?, ?)`
+				`INSERT INTO broken_links (id, job_id, source_url, target_url, status_code, anchor_text, link_type, status_code_desc)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
 			);
 			const batch = results.broken_links.map((bl: any) =>
 				blStmt.bind(
@@ -988,7 +993,8 @@ async function ingestResults(jobId: string, results: any, env: Env): Promise<voi
 					bl.source_url, bl.target_url,
 					bl.status_code ?? null,
 					(bl.anchor_text ?? "").substring(0, 200),
-					bl.link_type ?? "internal"
+					bl.link_type ?? "internal",
+					bl.status_code_desc ?? null
 				)
 			);
 			// Broken links are typically small, batch all at once

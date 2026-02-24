@@ -440,6 +440,7 @@ class AsyncWebCrawler:
                     crawl_result.js_execution_result = js_execution_result
                     crawl_result.mhtml = async_response.mhtml_data
                     crawl_result.ssl_certificate = async_response.ssl_certificate
+                    crawl_result.redirect_chain = async_response.redirect_chain
                     # Add captured network and console data if available
                     crawl_result.network_requests = async_response.network_requests
                     crawl_result.console_messages = async_response.console_messages

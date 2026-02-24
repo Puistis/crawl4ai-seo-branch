@@ -7,7 +7,9 @@ Operates on raw HTML + CrawlResult metadata to produce PageAuditResult.
 
 import re
 import json
+import hashlib
 import posixpath
+from collections import Counter
 from copy import deepcopy
 from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse, urljoin
@@ -100,9 +102,24 @@ def check_meta_description(tree: HtmlElement) -> MetaDescriptionCheck:
 
 
 def check_canonical(tree: HtmlElement, page_url: str) -> CanonicalCheck:
-    """Check canonical tag presence and self-referencing."""
+    """Check canonical tag presence, self-referencing, and multiple conflicting canonicals."""
     canonicals = tree.xpath('//link[@rel="canonical"]/@href')
-    value = canonicals[0].strip() if canonicals else None
+    if not canonicals:
+        return CanonicalCheck(
+            status=CheckStatus.WARNING, note="Missing canonical tag"
+        )
+
+    # Bug 11: Detect multiple conflicting canonical tags
+    unique_canonicals = list(dict.fromkeys(c.strip() for c in canonicals if c.strip()))
+    if len(unique_canonicals) > 1:
+        return CanonicalCheck(
+            value=unique_canonicals[0],
+            is_self_referencing=False,
+            status=CheckStatus.WARNING,
+            note=f"Multiple conflicting canonical tags ({len(unique_canonicals)} found): {', '.join(unique_canonicals[:3])}",
+        )
+
+    value = unique_canonicals[0] if unique_canonicals else None
     if not value:
         return CanonicalCheck(
             status=CheckStatus.WARNING, note="Missing canonical tag"
@@ -168,13 +185,17 @@ def check_headings(tree: HtmlElement) -> HeadingCheck:
     last_level = 0
     skipped: List[str] = []
 
+    has_empty_h1 = False
     for tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
         for el in tree.xpath(f"//{tag}"):
             text = (el.text_content() or "").strip()
             level = int(tag[1])
             all_headings.append(HeadingInfo(tag=tag, text=text))
             if tag == "h1":
-                h1_values.append(text)
+                if text:
+                    h1_values.append(text)
+                else:
+                    has_empty_h1 = True
             if last_level and level > last_level + 1:
                 skipped.append(f"h{last_level} -> h{level}")
             last_level = level
@@ -186,19 +207,24 @@ def check_headings(tree: HtmlElement) -> HeadingCheck:
         text = (el.text_content() or "").strip()
         ordered_headings.append(HeadingInfo(tag=tag, text=text))
 
-    # Recompute skipped levels from ordered headings
+    # FN-8: Recompute skipped levels from ordered headings with improved detection
     skipped = []
     last_level = 0
     for h in ordered_headings:
         level = int(h.tag[1])
-        if last_level and level > last_level + 1:
+        if last_level == 0 and level > 1:
+            # First heading should be H1; flag if it starts at a higher level
+            skipped.append(f"h1 -> h{level} (first heading is not H1)")
+        elif last_level and level > last_level + 1:
             skipped.append(f"h{last_level} -> h{level}")
         last_level = level
 
     h1_count = len(h1_values)
     hierarchy_valid = len(skipped) == 0
 
-    if h1_count == 0:
+    if h1_count == 0 and has_empty_h1:
+        status, note = CheckStatus.WARNING, "Empty H1 tag (element exists but contains no text)"
+    elif h1_count == 0:
         status, note = CheckStatus.FAIL, "Missing H1 tag"
     elif h1_count > 1:
         status, note = CheckStatus.WARNING, f"Multiple H1 tags ({h1_count})"
@@ -212,6 +238,7 @@ def check_headings(tree: HtmlElement) -> HeadingCheck:
     return HeadingCheck(
         h1_count=h1_count,
         h1_values=h1_values,
+        has_empty_h1=has_empty_h1,
         hierarchy_valid=hierarchy_valid,
         skipped_levels=skipped,
         all_headings=ordered_headings,
@@ -228,14 +255,18 @@ def check_images(tree: HtmlElement) -> ImageCheck:
     MODERN_FORMATS = {".webp", ".avif", ".svg"}
     LEGACY_PHOTO_FORMATS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif"}
     OVERSIZED_THRESHOLD = 2000  # pixels — either dimension > 2000 is suspicious
+    ALT_MAX_LENGTH = 125  # Google's practical display limit for alt text
 
     images: List[ImageInfo] = []
     missing_alt = 0
     empty_alt = 0
+    long_alt = 0
+    keyword_stuffed_alt = 0
     missing_dimensions = 0
     non_modern_format = 0
     potentially_oversized = 0
     missing_lazy_loading = 0
+    broken_src = 0
 
     all_imgs = tree.xpath("//img")
     for idx, img in enumerate(all_imgs):
@@ -256,6 +287,21 @@ def check_images(tree: HtmlElement) -> ImageCheck:
             missing_alt += 1
         elif is_empty:
             empty_alt += 1
+        elif alt and len(alt) > ALT_MAX_LENGTH:
+            long_alt += 1
+
+        # BUG-16: Keyword stuffing in alt text (same word repeated 3+ times)
+        if alt and len(alt) > 20:
+            alt_words = alt.lower().split()
+            if len(alt_words) >= 5:
+                from collections import Counter as _Counter
+                word_freq = _Counter(w for w in alt_words if len(w) > 3)
+                if word_freq and word_freq.most_common(1)[0][1] >= 3:
+                    keyword_stuffed_alt += 1
+
+        # BUG-17: Broken/empty src detection
+        if not src or src.strip() in ("", "#"):
+            broken_src += 1
 
         # Missing explicit width/height (causes CLS)
         has_dims = width is not None and height is not None
@@ -303,6 +349,10 @@ def check_images(tree: HtmlElement) -> ImageCheck:
     issues = []
     if missing_alt > 0:
         issues.append(f"{missing_alt} missing alt text")
+    if long_alt > 0:
+        issues.append(f"{long_alt} alt text too long (>{ALT_MAX_LENGTH} chars)")
+    if keyword_stuffed_alt > 0:
+        issues.append(f"{keyword_stuffed_alt} keyword-stuffed alt text")
     if missing_dimensions > 0:
         issues.append(f"{missing_dimensions} missing width/height")
     if non_modern_format > 0:
@@ -311,8 +361,10 @@ def check_images(tree: HtmlElement) -> ImageCheck:
         issues.append(f"{potentially_oversized} potentially oversized")
     if missing_lazy_loading > 0:
         issues.append(f"{missing_lazy_loading} missing lazy loading")
+    if broken_src > 0:
+        issues.append(f"{broken_src} broken/empty src")
 
-    if missing_alt > 0 or missing_dimensions > 0:
+    if missing_alt > 0 or missing_dimensions > 0 or long_alt > 0 or keyword_stuffed_alt > 0 or broken_src > 0:
         status = CheckStatus.WARNING
     elif issues:
         status = CheckStatus.INFO
@@ -328,10 +380,13 @@ def check_images(tree: HtmlElement) -> ImageCheck:
         total=total,
         missing_alt=missing_alt,
         empty_alt=empty_alt,
+        long_alt=long_alt,
+        keyword_stuffed_alt=keyword_stuffed_alt,
         missing_dimensions=missing_dimensions,
         non_modern_format=non_modern_format,
         potentially_oversized=potentially_oversized,
         missing_lazy_loading=missing_lazy_loading,
+        broken_src=broken_src,
         images=images,
         status=status,
         note=note,
@@ -357,7 +412,8 @@ def check_links(
     """
     Categorize internal/external/nofollow links and collect URLs.
     Now also captures per-link details (anchor_text, nofollow, link_type)
-    for the link_graph feature.
+    for the link_graph feature. Tracks javascript: hrefs, empty hrefs,
+    sponsored/ugc attributes, and internal nofollow links.
     """
     parsed_page = urlparse(page_url)
     page_domain = parsed_page.netloc.lower()
@@ -365,21 +421,41 @@ def check_links(
     internal = 0
     external = 0
     nofollow = 0
+    javascript_href_count = 0
+    empty_href_count = 0
+    sponsored_count = 0
+    ugc_count = 0
+    internal_nofollow = 0
     internal_urls: List[str] = []
     external_urls: List[str] = []
     link_details: List[LinkDetail] = []
     seen_external_domains: Dict[str, str] = {}  # domain -> first URL (dedup externals)
 
-    for a in tree.xpath("//a[@href]"):
+    for a in tree.xpath("//a"):
         href = (a.get("href") or "").strip()
-        if not href or href.startswith("#") or href.startswith("javascript:") \
-                or href.startswith("mailto:") or href.startswith("tel:"):
-            continue
-
         rel = (a.get("rel") or "").lower()
         is_nofollow = "nofollow" in rel
+        is_sponsored = "sponsored" in rel
+        is_ugc = "ugc" in rel
+
         if is_nofollow:
             nofollow += 1
+        if is_sponsored:
+            sponsored_count += 1
+        if is_ugc:
+            ugc_count += 1
+
+        # Track problematic href patterns (javascript:, empty, hash-only, missing)
+        if not href or href == "#":
+            empty_href_count += 1
+            continue
+        if href.startswith("javascript:"):
+            javascript_href_count += 1
+            continue
+        if href.startswith("mailto:") or href.startswith("tel:"):
+            continue
+        if href.startswith("#"):
+            continue
 
         anchor_text = _clean_anchor_text(a)
 
@@ -389,6 +465,8 @@ def check_links(
         if link_domain == page_domain:
             internal += 1
             internal_urls.append(absolute)
+            if is_nofollow:
+                internal_nofollow += 1
             link_details.append(LinkDetail(
                 url=absolute,
                 anchor_text=anchor_text,
@@ -420,6 +498,11 @@ def check_links(
         external_count=external,
         nofollow_count=nofollow,
         unique_internal_targets=len(set(internal_urls)),
+        javascript_href_count=javascript_href_count,
+        empty_href_count=empty_href_count,
+        sponsored_count=sponsored_count,
+        ugc_count=ugc_count,
+        internal_nofollow_count=internal_nofollow,
         internal_urls=internal_urls,
         external_urls=external_urls,
         link_details=link_details,
@@ -581,18 +664,20 @@ def _validate_structured_data(
     errors: List[str] = []
     warnings: List[str] = []
 
+    # Generic required field: @type must be valid
+    if schema_type == "unknown":
+        errors.append("Missing @type property")
+        return errors, warnings
+
     if "JobPosting" in schema_type:
-        # Required fields per Google
         required = ["title", "description", "datePosted", "hiringOrganization", "jobLocation"]
         for field in required:
             if field not in data:
                 errors.append(f"JobPosting missing required field: {field}")
-        # Recommended fields
         recommended = ["validThrough", "baseSalary", "employmentType", "identifier", "directApply"]
         for field in recommended:
             if field not in data:
                 warnings.append(f"JobPosting missing recommended field: {field}")
-        # Check expiration
         valid_through = data.get("validThrough")
         if valid_through and isinstance(valid_through, str):
             try:
@@ -602,6 +687,69 @@ def _validate_structured_data(
                     errors.append("JobPosting has expired (validThrough in the past)")
             except (ValueError, TypeError):
                 pass
+
+    elif "Article" in schema_type or "NewsArticle" in schema_type or "BlogPosting" in schema_type:
+        required = ["headline", "author", "datePublished"]
+        for field in required:
+            if field not in data:
+                errors.append(f"{schema_type} missing required field: {field}")
+        recommended = ["image", "dateModified", "publisher", "description"]
+        for field in recommended:
+            if field not in data:
+                warnings.append(f"{schema_type} missing recommended field: {field}")
+
+    elif "FAQPage" in schema_type:
+        main_entity = data.get("mainEntity")
+        if not main_entity:
+            errors.append("FAQPage missing required 'mainEntity'")
+        elif isinstance(main_entity, list):
+            for i, item in enumerate(main_entity[:10]):
+                if isinstance(item, dict):
+                    if "name" not in item and "text" not in item:
+                        errors.append(f"FAQPage question {i+1} missing 'name' (question text)")
+                    accepted = item.get("acceptedAnswer")
+                    if not accepted:
+                        errors.append(f"FAQPage question {i+1} missing 'acceptedAnswer'")
+
+    elif "Product" in schema_type:
+        required = ["name"]
+        for field in required:
+            if field not in data:
+                errors.append(f"Product missing required field: {field}")
+        recommended = ["image", "description", "offers", "review", "aggregateRating", "brand"]
+        for field in recommended:
+            if field not in data:
+                warnings.append(f"Product missing recommended field: {field}")
+
+    elif "LocalBusiness" in schema_type or "Restaurant" in schema_type:
+        required = ["name", "address"]
+        for field in required:
+            if field not in data:
+                errors.append(f"{schema_type} missing required field: {field}")
+        recommended = ["telephone", "openingHours", "image", "url", "geo"]
+        for field in recommended:
+            if field not in data:
+                warnings.append(f"{schema_type} missing recommended field: {field}")
+
+    elif "Event" in schema_type:
+        required = ["name", "startDate", "location"]
+        for field in required:
+            if field not in data:
+                errors.append(f"Event missing required field: {field}")
+        recommended = ["endDate", "description", "image", "offers", "performer", "organizer"]
+        for field in recommended:
+            if field not in data:
+                warnings.append(f"Event missing recommended field: {field}")
+
+    elif "Recipe" in schema_type:
+        required = ["name"]
+        for field in required:
+            if field not in data:
+                errors.append(f"Recipe missing required field: {field}")
+        recommended = ["image", "author", "prepTime", "cookTime", "recipeIngredient", "recipeInstructions"]
+        for field in recommended:
+            if field not in data:
+                warnings.append(f"Recipe missing recommended field: {field}")
 
     elif "Organization" in schema_type:
         if "name" not in data:
@@ -618,13 +766,69 @@ def _validate_structured_data(
         if "potentialAction" not in data:
             warnings.append("WebSite missing SearchAction (potentialAction)")
 
+    elif "Person" in schema_type:
+        if "name" not in data:
+            warnings.append("Person missing 'name'")
+
     return errors, warnings
 
 
+_VALID_REGION_CODES = frozenset({
+    "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
+    "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS",
+    "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN",
+    "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ",
+    "EC", "EE", "EG", "EH", "ER", "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR",
+    "GA", "GB", "GD", "GE", "GF", "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT",
+    "GU", "GW", "GY", "HK", "HM", "HN", "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ",
+    "IR", "IS", "IT", "JE", "JM", "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW",
+    "KY", "KZ", "LA", "LB", "LC", "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY",
+    "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK", "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS",
+    "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA", "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP",
+    "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT",
+    "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI",
+    "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS", "ST", "SV", "SX", "SY", "SZ",
+    "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ",
+    "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI", "VN", "VU",
+    "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW",
+})
+
+_VALID_LANG_CODES = frozenset({
+    "aa", "ab", "af", "ak", "am", "an", "ar", "as", "av", "ay", "az",
+    "ba", "be", "bg", "bh", "bi", "bm", "bn", "bo", "br", "bs",
+    "ca", "ce", "ch", "co", "cr", "cs", "cu", "cv", "cy",
+    "da", "de", "dv", "dz",
+    "ee", "el", "en", "eo", "es", "et", "eu",
+    "fa", "ff", "fi", "fj", "fo", "fr", "fy",
+    "ga", "gd", "gl", "gn", "gu", "gv",
+    "ha", "he", "hi", "ho", "hr", "ht", "hu", "hy", "hz",
+    "ia", "id", "ie", "ig", "ii", "ik", "in", "io", "is", "it", "iu",
+    "ja", "jv", "ka", "kg", "ki", "kj", "kk", "kl", "km", "kn",
+    "ko", "kr", "ks", "ku", "kv", "kw", "ky",
+    "la", "lb", "lg", "li", "ln", "lo", "lt", "lu", "lv",
+    "mg", "mh", "mi", "mk", "ml", "mn", "mr", "ms", "mt", "my",
+    "na", "nb", "nd", "ne", "ng", "nl", "nn", "no", "nr", "nv", "ny",
+    "oc", "oj", "om", "or", "os",
+    "pa", "pi", "pl", "ps", "pt",
+    "qu",
+    "rm", "rn", "ro", "ru", "rw",
+    "sa", "sc", "sd", "se", "sg", "si", "sk", "sl", "sm", "sn", "so",
+    "sq", "sr", "ss", "st", "su", "sv", "sw",
+    "ta", "te", "tg", "th", "ti", "tk", "tl", "tn", "to", "tr", "ts", "tt", "tw", "ty",
+    "ug", "uk", "ur", "uz",
+    "ve", "vi", "vo",
+    "wa", "wo",
+    "xh",
+    "yi", "yo",
+    "za", "zh", "zu",
+})
+
+
 def check_hreflang(tree: HtmlElement) -> HreflangCheck:
-    """Check hreflang tags for multilingual sites."""
+    """Check hreflang tags for multilingual sites with language code validation."""
     entries: List[HreflangEntry] = []
     has_x_default = False
+    validation_errors: List[str] = []
 
     for link in tree.xpath('//link[@rel="alternate"][@hreflang]'):
         lang = (link.get("hreflang") or "").strip()
@@ -633,17 +837,32 @@ def check_hreflang(tree: HtmlElement) -> HreflangCheck:
             entries.append(HreflangEntry(lang=lang, href=href))
             if lang == "x-default":
                 has_x_default = True
+            else:
+                # Validate language code (e.g. "en", "en-US", "zh-Hans")
+                parts = lang.split("-")
+                primary = parts[0].lower()
+                if primary not in _VALID_LANG_CODES:
+                    validation_errors.append(f"Invalid language code: '{lang}'")
+                elif len(parts) >= 2 and len(parts[1]) == 2 and parts[1].isalpha():
+                    # BUG-18: Validate region subtag (ISO 3166-1 alpha-2)
+                    region = parts[1].upper()
+                    if region not in _VALID_REGION_CODES:
+                        validation_errors.append(f"Invalid region code: '{lang}' ('{region}' is not a valid country)")
 
     if not entries:
         return HreflangCheck(status=CheckStatus.INFO, note="No hreflang tags (single language site)")
 
-    if not has_x_default:
+    if validation_errors:
+        status = CheckStatus.WARNING
+        note = f"{len(entries)} hreflang tags with {len(validation_errors)} invalid code(s): {'; '.join(validation_errors[:3])}"
+    elif not has_x_default:
         status, note = CheckStatus.WARNING, f"{len(entries)} hreflang tags but missing x-default"
     else:
         status, note = CheckStatus.PASS, f"{len(entries)} hreflang tags with x-default"
 
     return HreflangCheck(
-        entries=entries, has_x_default=has_x_default, status=status, note=note
+        entries=entries, has_x_default=has_x_default,
+        validation_errors=validation_errors, status=status, note=note,
     )
 
 
@@ -657,9 +876,10 @@ def check_content(tree: HtmlElement) -> ContentCheck:
     if not body:
         return ContentCheck(status=CheckStatus.WARNING, note="No body content found")
 
-    # Remove script, style, noscript elements before extracting text
+    # BUG-12: Remove script, style, noscript AND template elements (nav, header, footer)
+    # to get accurate main-content word count
     body_copy = deepcopy(body[0])
-    for tag in ("script", "style", "noscript"):
+    for tag in ("script", "style", "noscript", "nav", "header", "footer"):
         for el in body_copy.xpath(f".//{tag}"):
             el.getparent().remove(el)
 
@@ -668,7 +888,7 @@ def check_content(tree: HtmlElement) -> ContentCheck:
 
     # Lower threshold for form/transactional pages
     has_form = bool(tree.xpath("//form"))
-    thin_threshold = 100 if has_form else 300
+    thin_threshold = 100 if has_form else 200
 
     if words < thin_threshold:
         label = f"Thin content ({words} words, <{thin_threshold})"
@@ -755,6 +975,22 @@ def check_mixed_content(tree: HtmlElement, page_url: str) -> MixedContentCheck:
             note=f"{len(insecure)} insecure resource(s) on HTTPS page",
         )
     return MixedContentCheck(status=CheckStatus.PASS, note="No mixed content detected")
+
+
+def check_meta_refresh(tree: HtmlElement) -> Optional[str]:
+    """Detect meta refresh redirects. Returns the redirect URL if found, else None."""
+    refresh_tags = tree.xpath('//meta[@http-equiv="refresh"]/@content')
+    if refresh_tags:
+        content = refresh_tags[0].strip()
+        # Parse "5;url=/target" or "0; url=https://example.com"
+        # BUG-03: Don't lowercase the URL — only lowercase for the "url=" key detection
+        lower = content.lower()
+        if "url=" in lower:
+            idx = lower.index("url=") + 4
+            url_part = content[idx:].strip().strip("'\"")
+            return url_part if url_part else None
+        return content
+    return None
 
 
 def check_viewport(tree: HtmlElement) -> ViewportCheck:
@@ -864,6 +1100,219 @@ def check_performance(
 # ─── Main Per-Page Audit ──────────────────────────────────────────────
 
 
+def check_hidden_text(tree: HtmlElement) -> List[str]:
+    """Detect hidden text via inline style: display:none, visibility:hidden,
+    white-on-white text color, and off-screen positioning (FN-11)."""
+    hidden = []
+    for el in tree.xpath('//*[@style]'):
+        style_raw = (el.get("style") or "")
+        style = style_raw.lower().replace(" ", "")
+        text = (el.text_content() or "").strip()
+        if not text:
+            continue
+        tag = el.tag
+        snippet = text[:80]
+        # Method 1 & 2: display:none, visibility:hidden
+        if "display:none" in style or "visibility:hidden" in style:
+            hidden.append(f"<{tag}> hidden via CSS: \"{snippet}\"")
+        # Method 3: white-on-white or same color as background
+        elif "color:" in style:
+            import re as _re
+            colors = _re.findall(r'(?:^|;|\s)color\s*:\s*([^;]+)', style_raw.lower())
+            bg_colors = _re.findall(r'background(?:-color)?\s*:\s*([^;]+)', style_raw.lower())
+            if colors and bg_colors:
+                fg = colors[0].strip()
+                bg = bg_colors[0].strip()
+                if fg == bg or (fg in ("white", "#fff", "#ffffff", "rgb(255,255,255)") and bg in ("white", "#fff", "#ffffff", "rgb(255,255,255)")):
+                    hidden.append(f"<{tag}> hidden via same text/background color: \"{snippet}\"")
+            elif colors:
+                fg = colors[0].strip()
+                if fg in ("white", "#fff", "#ffffff", "rgb(255,255,255)"):
+                    hidden.append(f"<{tag}> hidden via white text on default background: \"{snippet}\"")
+        # Method 4: off-screen positioning
+        if "position:" in style and any(off in style for off in ("left:-", "top:-", "left:-9999", "top:-9999")):
+            if f"<{tag}>" not in str(hidden):  # avoid duplicate if already flagged
+                hidden.append(f"<{tag}> hidden via off-screen positioning: \"{snippet}\"")
+        elif "text-indent:" in style:
+            import re as _re
+            indent = _re.search(r'text-indent\s*:\s*(-\d+)', style_raw.lower())
+            if indent and int(indent.group(1)) < -999:
+                hidden.append(f"<{tag}> hidden via negative text-indent: \"{snippet}\"")
+    return hidden
+
+
+_STOP_WORDS = frozenset({
+    # Articles, pronouns, prepositions, conjunctions
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had",
+    "her", "was", "one", "our", "out", "has", "have", "been", "from", "this",
+    "that", "with", "they", "will", "each", "make", "like", "just", "over",
+    "such", "take", "than", "them", "very", "some", "could", "would", "into",
+    # Additional common English words that cause false positives
+    "page", "link", "links", "site", "web", "home", "menu", "main", "more",
+    "about", "here", "also", "back", "when", "your", "what", "which", "their",
+    "there", "where", "were", "been", "being", "other", "after", "before",
+    "most", "only", "then", "first", "last", "next", "also", "does", "don",
+    "how", "its", "let", "may", "new", "now", "old", "see", "way", "who",
+    "did", "get", "got", "him", "his", "she", "too", "use", "used", "using",
+    "these", "those", "through", "between", "should", "because", "while",
+    "any", "every", "much", "many", "own", "same", "another", "know",
+    "still", "well", "even", "come", "made", "find", "said", "say",
+    # Common web/navigation words
+    "click", "read", "view", "open", "close", "search", "content", "text",
+    "title", "image", "images", "list", "item", "items", "data", "type",
+    "name", "number", "info", "help", "contact", "email", "share", "follow",
+    "post", "blog", "article", "tag", "tags", "category", "comment",
+    "footer", "header", "navigation", "sidebar", "copyright", "privacy",
+    "terms", "policy", "cookie", "cookies", "accept", "skip", "toggle",
+})
+
+
+def check_keyword_stuffing(tree: HtmlElement) -> Optional[str]:
+    """Detect keyword stuffing by checking if any single word appears at >4% density with 15+ occurrences."""
+    body = tree.xpath("//body")
+    if not body:
+        return None
+    body_copy = deepcopy(body[0])
+    for tag in ("script", "style", "noscript", "nav", "footer"):
+        for el in body_copy.xpath(f".//{tag}"):
+            el.getparent().remove(el)
+    text = body_copy.text_content().lower()
+    words = re.findall(r'\b[a-z]{3,}\b', text)  # min 3 chars to skip noise
+    if len(words) < 50:
+        return None
+    counts = Counter(words)
+    total = len(words)
+    for word, count in counts.most_common(10):
+        if word in _STOP_WORDS:
+            continue
+        density = count / total
+        if density > 0.04 and count >= 15:
+            return f"'{word}' appears {count} times ({density:.1%} density)"
+    return None
+
+
+_PLACEHOLDER_PATTERNS = [
+    "lorem ipsum", "dolor sit amet", "consectetur adipiscing",
+    "sed do eiusmod", "tempor incididunt", "ut labore et dolore",
+]
+
+
+def check_placeholder_content(tree: HtmlElement) -> bool:
+    """Detect lorem ipsum / placeholder content in body text or meta description.
+    Excludes navigation, anchor text, header, and footer to avoid false positives
+    from link labels pointing to placeholder-content pages (BUG-9)."""
+    body = tree.xpath("//body")
+    text = ""
+    if body:
+        body_copy = deepcopy(body[0])
+        for tag in ("nav", "header", "footer", "a"):
+            for el in body_copy.xpath(f".//{tag}"):
+                el.getparent().remove(el)
+        text = body_copy.text_content().lower()
+    desc = tree.xpath('//meta[@name="description"]/@content')
+    if desc:
+        text += " " + desc[0].lower()
+    return any(p in text for p in _PLACEHOLDER_PATTERNS)
+
+
+_SOFT_404_PATTERNS = re.compile(
+    r"page\s*not\s*found|404\s*error|404\s*not\s*found|"
+    r"not\s*found|doesn.?t\s*exist|no\s*longer\s*available|"
+    r"we\s*couldn.?t\s*find|sorry.*page.*missing",
+    re.IGNORECASE,
+)
+
+
+def _compute_content_hash(tree: HtmlElement) -> Optional[str]:
+    """Compute a SHA-256 hash of normalized body text for duplicate content detection."""
+    body = tree.xpath("//body")
+    if not body:
+        return None
+    body_copy = deepcopy(body[0])
+    for tag in ("script", "style", "noscript", "nav", "header", "footer"):
+        for el in body_copy.xpath(f".//{tag}"):
+            el.getparent().remove(el)
+    text = " ".join(body_copy.text_content().lower().split())
+    if len(text) < 50:
+        return None
+    return hashlib.sha256(text[:5000].encode("utf-8", errors="replace")).hexdigest()
+
+
+def _compute_content_shingles(tree: HtmlElement, shingle_size: int = 5) -> Optional[frozenset]:
+    """Compute a set of word-level shingles from body text for near-duplicate detection (BUG-8).
+    Returns a frozenset of shingle hashes, or None if content is too short."""
+    body = tree.xpath("//body")
+    if not body:
+        return None
+    body_copy = deepcopy(body[0])
+    for tag in ("script", "style", "noscript", "nav", "header", "footer"):
+        for el in body_copy.xpath(f".//{tag}"):
+            el.getparent().remove(el)
+    words = body_copy.text_content().lower().split()
+    if len(words) < 20:
+        return None
+    shingles = set()
+    for i in range(len(words) - shingle_size + 1):
+        shingle = " ".join(words[i:i + shingle_size])
+        shingles.add(hashlib.md5(shingle.encode("utf-8", errors="replace")).hexdigest()[:8])
+    return frozenset(shingles)
+
+
+def _detect_soft_404(tree: HtmlElement, status_code: Optional[int]) -> bool:
+    """Detect soft 404: page returns 200 but content indicates 'not found'."""
+    if status_code and status_code != 200:
+        return False
+    # Check title (both text() and text_content() for robustness)
+    for title_el in tree.xpath("//title"):
+        title_text = (title_el.text_content() or "").strip()
+        if title_text and _SOFT_404_PATTERNS.search(title_text):
+            return True
+    # Check H1
+    for h1 in tree.xpath("//h1")[:3]:
+        text = (h1.text_content() or "").strip()
+        if text and _SOFT_404_PATTERNS.search(text):
+            return True
+    # Check body text (first 500 chars) for error-page patterns
+    body = tree.xpath("//body")
+    if body:
+        body_text = (body[0].text_content() or "")[:500].strip()
+        if _SOFT_404_PATTERNS.search(body_text):
+            return True
+    return False
+
+
+def _count_iframes(tree: HtmlElement) -> tuple:
+    """Count iframe elements and detect missing title / empty src (FN-12).
+    Returns (total_count, missing_title_count, empty_src_count)."""
+    iframes = tree.xpath("//iframe")
+    missing_title = 0
+    empty_src = 0
+    for iframe in iframes:
+        title = (iframe.get("title") or "").strip()
+        src = (iframe.get("src") or "").strip()
+        if not title:
+            missing_title += 1
+        if not src:
+            empty_src += 1
+    return len(iframes), missing_title, empty_src
+
+
+def _check_pagination(tree: HtmlElement) -> Tuple[Optional[str], Optional[str]]:
+    """Detect rel=next/prev pagination links. Returns (rel_next_url, rel_prev_url)."""
+    rel_next = None
+    rel_prev = None
+    for link in tree.xpath('//link[@rel]'):
+        rel = (link.get("rel") or "").lower()
+        href = (link.get("href") or "").strip()
+        if not href:
+            continue
+        if rel == "next":
+            rel_next = href
+        elif rel == "prev" or rel == "previous":
+            rel_prev = href
+    return rel_next, rel_prev
+
+
 def audit_page(
     url: str,
     raw_html: str,
@@ -892,6 +1341,16 @@ def audit_page(
             title=TitleCheck(status=CheckStatus.FAIL, note="Could not parse HTML"),
         )
 
+    rel_next, rel_prev = _check_pagination(tree)
+    iframe_count, iframes_missing_title, iframes_empty_src = _count_iframes(tree)
+
+    # FN-9: Detect lorem ipsum in meta description separately
+    desc_vals = tree.xpath('//meta[@name="description"]/@content')
+    has_placeholder_meta_desc = False
+    if desc_vals:
+        desc_lower = desc_vals[0].lower()
+        has_placeholder_meta_desc = any(p in desc_lower for p in _PLACEHOLDER_PATTERNS)
+
     return PageAuditResult(
         url=url,
         status_code=status_code,
@@ -913,6 +1372,21 @@ def audit_page(
         lang=check_lang(tree),
         charset=check_charset(tree),
         performance=check_performance(tree, raw_html, response_time_ms, resource_breakdown),
+        meta_refresh_url=check_meta_refresh(tree),
+        hidden_text=check_hidden_text(tree),
+        keyword_stuffing=check_keyword_stuffing(tree),
+        has_placeholder_content=check_placeholder_content(tree),
+        content_hash=_compute_content_hash(tree),
+        content_shingles=_compute_content_shingles(tree),
+        is_soft_404=_detect_soft_404(tree, status_code),
+        iframe_count=iframe_count,
+        iframes_missing_title=iframes_missing_title,
+        iframes_empty_src=iframes_empty_src,
+        has_placeholder_meta_desc=has_placeholder_meta_desc,
+        rel_next=rel_next,
+        rel_prev=rel_prev,
+        inline_css_count=len(tree.xpath('//*[@style]')),
+        inline_style_bytes=sum(len((el.text or '').encode()) for el in tree.xpath('//style')),
     )
 
 
